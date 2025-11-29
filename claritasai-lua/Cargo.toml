@@ -1,0 +1,10 @@
+[package]
+name = "claritasai-lua"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+mlua = { workspace = true }
+tracing = { workspace = true }
+claritasai-core = { path = "../claritasai-core" }

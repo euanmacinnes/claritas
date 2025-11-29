@@ -1,0 +1,78 @@
+version: 1
+server:
+  bind: 0.0.0.0
+  port: 7040
+
+storage:
+  backend: clarium
+  clarium:
+    dsn: "postgres://localhost:5433/claritas"
+
+workspace:
+  python:
+    root: ${PY_PROJ_ROOT}
+  clarium:
+    spec_root: ${CLARIUM_SPEC_ROOT}
+    output_dir: ./out/sql
+  rust:
+    root: ${RS_PROJ_ROOT}
+
+mcp:
+  startup:
+    launch_local: true
+    disabled: []
+  transports:
+    mode: auto
+    http_bind: 127.0.0.1
+    http_base_port: 7440
+  servers:
+    - id: python
+      endpoint: auto
+      command: claritas_mcp_python
+      args: []
+    - id: rust
+      endpoint: auto
+      command: claritas_mcp_rust
+      args: []
+    - id: clarium
+      endpoint: auto
+      command: claritas_mcp_clarium
+      args: ["--dsn","postgres://localhost:5433/claritas","--spec","${CLARIUM_SPEC_ROOT}"]
+
+notifications:
+  telegram:
+    enabled: true
+    bot_token: ${TELEGRAM_BOT_TOKEN}
+    chat_id: ${TELEGRAM_CHAT_ID}
+    template_new_prompt: "[ClaritasAI] Input needed for run {{run_id}}: {{question}}"
+    template_run_done: "[ClaritasAI] Run {{run_id}} completed with status {{status}}"
+  email:
+    enabled: true
+    smtp_host: ${SMTP_HOST}
+    smtp_port: 587
+    username: ${SMTP_USER}
+    password: ${SMTP_PASS}
+    from: claritasai@example.com
+    to: user@example.com
+    subject_prompt: "ClaritasAI: input needed ({{run_id}})"
+    subject_done: "ClaritasAI: run complete ({{run_id}})"
+  whatsapp:
+    enabled: false
+    provider: twilio
+    account_sid: ${TWILIO_SID}
+    auth_token: ${TWILIO_TOKEN}
+    from: "+1234567890"
+    to: "+0987654321"
+
+agents:
+  planner:
+    model: mcp:openai:gpt-4o
+    tools: ["python.*", "rust.*", "clarium.*", "code.*", "fs.*", "db.*"]
+  verifier:
+    model: mcp:ollama:llama3.1
+    tools: ["clarium.validate_sql", "python.lint", "python.test.*", "rust.clippy", "rust.test"]
+  executor:
+    model: none
+    tools: ["python.*", "rust.*", "clarium.*", "fs.*", "deploy.*"]
+
+experiments: []

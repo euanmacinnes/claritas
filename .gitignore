@@ -1,0 +1,13 @@
+target/
+**/target/
+**/.cargo/
+**/.DS_Store
+**/node_modules/
+**/.idea/
+**/.vscode/
+Cargo.lock
+/.env
+/.env.*
+logs/
+data/
+out/

@@ -1,0 +1,41 @@
+[workspace]
+members = [
+    "claritasai-core",
+    "claritasai-runtime",
+    "claritasai-mcp",
+    "claritasai-lua",
+    "claritasai-plan",
+    "claritasai-verify",
+    "claritasai-abtest",
+    "claritasai-web",
+    "claritasai-notify",
+    "claritasai-app",
+    "claritas_mcp_python",
+    "claritas_mcp_rust",
+    "claritas_mcp_clarium",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+authors = ["ClaritasAI <dev@claritas.ai>"]
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+thiserror = "1"
+camino = "1"
+chrono = { version = "0.4", features = ["serde"] }
+mlua = { version = "0.10", features = ["lua54", "vendored", "send", "serialize"] }
+axum = { version = "0.7", features = ["macros"] }
+tokio-stream = "0.1"
+hyper = { version = "1", features = ["full"] }
+tower = "0.5"
+serde_yaml = "0.9"
+clap = { version = "4", features = ["derive"] }
+http-body-util = "0.1"
