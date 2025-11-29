@@ -199,6 +199,21 @@ async fn handle_line(
                 json!({"ok": false, "error": "missing DSN for db.schema.diff"})
             }
         }
+        "db.index.suggest" => {
+            // Params: { table: string, workload?: [{query: string, freq?: number}] }
+            let table = params.get("table").and_then(|v| v.as_str()).unwrap_or("");
+            let workload = params.get("workload").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            if table.is_empty() {
+                json!({"ok": false, "error": "param {table} is required"})
+            } else if let Some(ref dsn_s) = dsn {
+                match index_suggest(dsn_s, table, workload).await {
+                    Ok(v) => v,
+                    Err(e) => json!({"ok": false, "error": {"message": e.to_string()}}),
+                }
+            } else {
+                json!({"ok": false, "error": "missing DSN for db.index.suggest"})
+            }
+        }
         _ => json!({"error": {"code": -32601, "message": format!("method not found: {}", method)}}),
     };
 
@@ -242,7 +257,23 @@ async fn explain_with_postgres(dsn: &str, sql: &str, analyze: bool) -> anyhow::R
     let rows = client.query(q.as_str(), &[]).await?;
     let mut plan_lines: Vec<String> = Vec::new();
     for r in rows { let txt: &str = r.get(0); plan_lines.push(txt.to_string()); }
-    Ok(json!({"ok": true, "plan": plan_lines}))
+    if analyze {
+        // Parse timing lines like "Planning Time: 1.234 ms" and "Execution Time: 5.678 ms"
+        let mut planning_ms: Option<f64> = None;
+        let mut execution_ms: Option<f64> = None;
+        for l in &plan_lines {
+            let s = l.trim();
+            if s.starts_with("Planning Time:") {
+                if let Some(val) = s.split(':').nth(1) { planning_ms = extract_ms(val); }
+            } else if s.starts_with("Execution Time:") {
+                if let Some(val) = s.split(':').nth(1) { execution_ms = extract_ms(val); }
+            }
+        }
+        let total_runtime_ms = execution_ms; // Postgres reports Execution Time as total runtime
+        Ok(json!({"ok": true, "plan": plan_lines, "planning_ms": planning_ms, "execution_ms": execution_ms, "total_runtime_ms": total_runtime_ms}))
+    } else {
+        Ok(json!({"ok": true, "plan": plan_lines}))
+    }
 }
 
 async fn execute_with_postgres(dsn: &str, sql: &str, limit: i64) -> anyhow::Result<Value> {
@@ -363,13 +394,88 @@ async fn diff_schemas(dsn: &str, left: &str, right: &str) -> anyhow::Result<Valu
         }
     }
 
+    // indexes
+    async fn get_indexes(client: &pg::Client, schema: &str) -> anyhow::Result<Vec<Value>> {
+        let q = r#"
+            SELECT schemaname, tablename, indexname, indexdef
+            FROM pg_indexes
+            WHERE schemaname = $1
+            ORDER BY tablename, indexname
+        "#;
+        let rows = client.query(q, &[&schema]).await?;
+        let mut out = Vec::new();
+        for r in rows {
+            let schemaname: &str = r.get(0);
+            let table: &str = r.get(1);
+            let name: &str = r.get(2);
+            let def: &str = r.get(3);
+            out.push(json!({"schema": schemaname, "table": table, "name": name, "def": def}));
+        }
+        Ok(out)
+    }
+    let left_indexes = get_indexes(&client, left).await?;
+    let right_indexes = get_indexes(&client, right).await?;
+
+    // constraints
+    async fn get_constraints(client: &pg::Client, schema: &str) -> anyhow::Result<Vec<Value>> {
+        let q = r#"
+            SELECT tc.table_name, tc.constraint_name, tc.constraint_type,
+                   kcu.column_name, ccu.table_name AS foreign_table_name, ccu.column_name AS foreign_column_name
+            FROM information_schema.table_constraints AS tc
+            LEFT JOIN information_schema.key_column_usage AS kcu
+              ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+            LEFT JOIN information_schema.constraint_column_usage AS ccu
+              ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
+            WHERE tc.table_schema = $1
+            ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position
+        "#;
+        let rows = client.query(q, &[&schema]).await?;
+        let mut grouped: std::collections::BTreeMap<(String,String,String), Vec<Value>> = std::collections::BTreeMap::new();
+        for r in rows {
+            let table: &str = r.get(0);
+            let cname: &str = r.get(1);
+            let ctype: &str = r.get(2);
+            let col: Option<&str> = r.try_get(3).ok();
+            let ftable: Option<&str> = r.try_get(4).ok();
+            let fcol: Option<&str> = r.try_get(5).ok();
+            grouped.entry((table.to_string(), cname.to_string(), ctype.to_string()))
+                .or_default()
+                .push(json!({"column": col, "ref_table": ftable, "ref_column": fcol}));
+        }
+        let mut out = Vec::new();
+        for ((table, cname, ctype), cols) in grouped {
+            out.push(json!({"table": table, "name": cname, "type": ctype, "details": cols}));
+        }
+        Ok(out)
+    }
+    let left_constraints = get_constraints(&client, left).await?;
+    let right_constraints = get_constraints(&client, right).await?;
+
+    // human-readable summary
+    let mut summary: Vec<String> = Vec::new();
+    for t in &tables_only_left { summary.push(format!("- only in {}: table {}", left, t)); }
+    for t in &tables_only_right { summary.push(format!("- only in {}: table {}", right, t)); }
+    for diff in &column_diffs {
+        if let (Some(table), Some(only_l), Some(only_r)) = (
+            diff.get("table").and_then(|v| v.as_str()),
+            diff.get("columns_only_left").and_then(|v| v.as_array()),
+            diff.get("columns_only_right").and_then(|v| v.as_array()),
+        ) {
+            if !only_l.is_empty() { summary.push(format!("- {}: cols only in {}: {}", table, left, join_strs(only_l))); }
+            if !only_r.is_empty() { summary.push(format!("- {}: cols only in {}: {}", table, right, join_strs(only_r))); }
+        }
+    }
+
     Ok(json!({
         "ok": true,
         "left": left,
         "right": right,
         "tables_only_left": tables_only_left,
         "tables_only_right": tables_only_right,
-        "column_diffs": column_diffs
+        "column_diffs": column_diffs,
+        "indexes": { left: left_indexes, right: right_indexes },
+        "constraints": { left: left_constraints, right: right_constraints },
+        "summary": summary
     }))
 }
 
@@ -395,4 +501,92 @@ fn db_error_json_from_db(db: &pg::error::DbError) -> serde_json::Value {
         "detail": detail,
         "hint": hint,
     })
+}
+
+// --- Utility helpers ---
+fn extract_ms(s: &str) -> Option<f64> {
+    // expects like " 1.234 ms" or "1 ms"
+    let trimmed = s.trim();
+    let num = trimmed.trim_end_matches("ms").trim();
+    num.parse::<f64>().ok()
+}
+
+fn join_strs(arr: &Vec<Value>) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for v in arr {
+        if let Some(s) = v.as_str() { out.push(s.to_string()); }
+        else { out.push(v.to_string()); }
+    }
+    out.join(", ")
+}
+
+async fn index_suggest(dsn: &str, table: &str, workload: Vec<Value>) -> anyhow::Result<Value> {
+    use regex::Regex;
+    let (client, conn) = pg::connect(dsn, pg::NoTls).await?;
+    tokio::spawn(async move { let _ = conn.await; });
+    // Skip very small tables
+    let est_rows: f64 = {
+        let q = "SELECT reltuples::float8 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = $1 ORDER BY n.nspname LIMIT 1";
+        match client.query_opt(q, &[&table]).await? { Some(r) => r.get(0), None => 0.0 }
+    };
+    if est_rows < 10_000.0 {
+        return Ok(json!({"ok": true, "suggestions": [], "reason": "table too small (reltuples < 10k)"}));
+    }
+
+    // Very simple heuristic parser: extract columns from WHERE equality and JOIN ON equality
+    let re_where = Regex::new(r"(?i)\bwhere\b([^;]+)").ok();
+    let re_eq_col = Regex::new(r"(?i)\b([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*\$?\d+|\b([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*'[^']*'").ok();
+    let re_join = Regex::new(r"(?i)\bjoin\b[^\n]*\bon\b([^\n]+)").ok();
+
+    use std::collections::BTreeMap;
+    let mut col_score: BTreeMap<String, f64> = BTreeMap::new();
+    for item in workload.iter() {
+        let q = item.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        let freq = item.get("freq").and_then(|v| v.as_f64()).unwrap_or(1.0);
+        if q.is_empty() { continue; }
+        if let Some(re) = &re_where {
+            if let Some(cap) = re.captures(q) {
+                let where_clause = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                if let Some(eq) = &re_eq_col {
+                    for cap2 in eq.captures_iter(where_clause) {
+                        if let Some(m) = cap2.get(1).or_else(|| cap2.get(2)) {
+                            *col_score.entry(m.as_str().to_string()).or_insert(0.0) += 1.0 * freq;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(rj) = &re_join {
+            for cap in rj.captures_iter(q) {
+                let on = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                // naive split by '=' to catch join keys like a.user_id = b.id
+                for part in on.split('=') {
+                    let token = part.trim();
+                    // take trailing identifier
+                    if let Some(id) = token.split('.').last() {
+                        if id.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                            *col_score.entry(id.to_string()).or_insert(0.0) += 0.5 * freq;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Build suggestions: top-2 columns by score, propose composite index
+    let mut scored: Vec<(String, f64)> = col_score.into_iter().collect();
+    scored.sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut suggestions: Vec<Value> = Vec::new();
+    if !scored.is_empty() {
+        let first = &scored[0].0;
+        let ddl = format!("CREATE INDEX CONCURRENTLY IF NOT EXISTS {0}_{1}_idx ON {0} ({1})", table, first);
+        suggestions.push(json!({"table": table, "columns": [first], "reason": "frequent equality/join on column", "ddl": ddl}));
+        if scored.len() > 1 {
+            let second = &scored[1].0;
+            let ddl2 = format!("CREATE INDEX CONCURRENTLY IF NOT EXISTS {0}_{1}_{2}_idx ON {0} ({1}, {2})", table, first, second);
+            suggestions.push(json!({"table": table, "columns": [first, second], "reason": "composite index based on workload frequency", "ddl": ddl2}));
+        }
+    }
+
+    Ok(json!({"ok": true, "suggestions": suggestions}))
 }

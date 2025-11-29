@@ -10,7 +10,9 @@ use tracing_subscriber::EnvFilter;
 use tokio::sync::broadcast;
 
 use claritasai_web::{router, WebState};
+use claritasai_agents::AgentsHarness;
 use claritasai_mcp::ToolRegistry;
+use claritasai_notify::{NotifierHub, Provider as NotifyProvider, TelegramConfig as NotifyTelegramCfg, EmailConfig as NotifyEmailCfg, WhatsAppConfig as NotifyWhatsAppCfg};
 use tokio_postgres as pg;
 use url::Url;
 
@@ -55,6 +57,9 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Shared event channel for SSE across app (MCP supervision + Web UI)
+    let (event_tx, _event_rx) = broadcast::channel::<String>(256);
+
     // Basic local MCP supervision (spawn processes) if enabled
     if cli.no_local_mcp {
         info!("local MCP hosts disabled via CLI");
@@ -68,8 +73,6 @@ async fn main() -> Result<()> {
                     .iter()
                     .map(|s| s.to_lowercase())
                     .collect();
-                // Create a shared event channel for streaming to the web UI
-                let (evt_tx, _evt_rx) = broadcast::channel::<String>(256);
 
                 for server in &cfg.mcp.servers {
                     let id_lc = server.id.to_lowercase();
@@ -80,7 +83,7 @@ async fn main() -> Result<()> {
                     if server.endpoint.as_deref().unwrap_or("auto").eq_ignore_ascii_case("auto") {
                         // supervise each local host in its own task
                         let server_cloned = server.clone();
-                        let tx_clone = evt_tx.clone();
+                        let tx_clone = event_tx.clone();
                         tokio::spawn(async move {
                             supervise_local_mcp(server_cloned, Some(tx_clone)).await;
                         });
@@ -113,8 +116,7 @@ async fn main() -> Result<()> {
 
     // Web server
     // Build initial WebState from config when available
-    // Attach an event channel for SSE
-    let (event_tx, _event_rx) = broadcast::channel::<String>(256);
+    // Attach the shared event channel for SSE
     let mut ws = build_web_state_from_config(cfg.as_ref());
     ws.event_tx = Some(event_tx.clone());
     // Initialize a simple ToolRegistry from config
@@ -147,6 +149,10 @@ struct AppConfig {
     mcp: McpConfig,
     #[allow(dead_code)]
     storage: Option<StorageConfig>,
+    #[allow(dead_code)]
+    notify: Option<NotifyConfig>,
+    #[allow(dead_code)]
+    agents: Option<AgentsConfig>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -176,6 +182,52 @@ struct WorkspaceConfig {
     clarium: Option<ClariumWorkspace>,
     #[allow(dead_code)]
     rust: Option<RustWorkspace>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AgentsConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    ollama: Option<OllamaConfig>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct OllamaConfig {
+    #[serde(default)] url: String,
+    #[serde(default)] model: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct NotifyConfig {
+    #[serde(default)]
+    telegram: Option<NotifyTelegramBlock>,
+    #[serde(default)]
+    email: Option<NotifyEmailBlock>,
+    #[serde(default)]
+    whatsapp: Option<NotifyWhatsAppBlock>,
+    #[serde(default)]
+    max_retries: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct NotifyTelegramBlock {
+    #[serde(default)] bot_token: String,
+    #[serde(default)] chat_id: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct NotifyEmailBlock {
+    #[serde(default)] smtp_url: String,
+    #[serde(default)] from: String,
+    #[serde(default)] to: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct NotifyWhatsAppBlock {
+    #[serde(default)] api_url: String,
+    #[serde(default)] token: String,
+    #[serde(default)] to: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -274,6 +326,41 @@ fn build_web_state_from_config(cfg: Option<&AppConfig>) -> WebState {
                 state.mcp_clarium_args = s.args.iter().map(|a| expand_env_vars(a)).collect();
             }
         }
+        // Build NotifierHub from config if present
+        if let Some(nc) = &cfg.notify {
+            let mut hub = NotifierHub::new();
+            if let Some(maxr) = nc.max_retries { hub.max_retries = maxr; }
+            if let Some(tg) = &nc.telegram {
+                if !tg.bot_token.is_empty() && !tg.chat_id.is_empty() {
+                    let cfg = NotifyTelegramCfg { bot_token: expand_env_vars(&tg.bot_token), chat_id: expand_env_vars(&tg.chat_id) };
+                    hub = hub.with_provider(NotifyProvider::Telegram(cfg));
+                }
+            }
+            if let Some(em) = &nc.email {
+                if !em.smtp_url.is_empty() && !em.from.is_empty() && !em.to.is_empty() {
+                    let cfg = NotifyEmailCfg { smtp_url: expand_env_vars(&em.smtp_url), from: em.from.clone(), to: em.to.clone() };
+                    hub = hub.with_provider(NotifyProvider::Email(cfg));
+                }
+            }
+            if let Some(wa) = &nc.whatsapp {
+                if !wa.api_url.is_empty() && !wa.token.is_empty() && !wa.to.is_empty() {
+                    let cfg = NotifyWhatsAppCfg { api_url: expand_env_vars(&wa.api_url), token: expand_env_vars(&wa.token), to: wa.to.clone() };
+                    hub = hub.with_provider(NotifyProvider::WhatsApp(cfg));
+                }
+            }
+            state.notifier_hub = Some(hub);
+        }
+
+        // Build AgentsHarness (Ollama) if enabled
+        if let Some(ag) = &cfg.agents {
+            if ag.enabled {
+                if let Some(ol) = &ag.ollama {
+                    if !ol.url.is_empty() && !ol.model.is_empty() {
+                        state.agents = Some(AgentsHarness::new(expand_env_vars(&ol.url), expand_env_vars(&ol.model)));
+                    }
+                }
+            }
+        }
     }
     state
 }
@@ -311,6 +398,14 @@ async fn supervise_local_mcp(server: McpServer, events: Option<broadcast::Sender
 
     loop {
         info!(id = %id, command = %cmd_name, args = ?args, "starting local MCP host");
+        if let Some(tx) = &events {
+            let _ = tx.send(serde_json::json!({
+                "event": "host_health",
+                "id": id,
+                "ok": true,
+                "status": "starting"
+            }).to_string());
+        }
         let mut cmd = Command::new(&cmd_name);
         cmd.args(&args)
             .stdin(std::process::Stdio::piped())
@@ -378,20 +473,55 @@ async fn supervise_local_mcp(server: McpServer, events: Option<broadcast::Sender
                 match child.wait().await {
                     Ok(status) => {
                         warn!(id = %id, exit = %status, "MCP host exited");
+                        if let Some(tx) = &events {
+                            let _ = tx.send(serde_json::json!({
+                                "event": "host_health",
+                                "id": id,
+                                "ok": false,
+                                "status": "exited",
+                                "message": format!("exit status: {}", status)
+                            }).to_string());
+                        }
                     }
                     Err(e) => {
                         error!(id = %id, error = %e, "failed waiting for MCP host");
+                        if let Some(tx) = &events {
+                            let _ = tx.send(serde_json::json!({
+                                "event": "host_health",
+                                "id": id,
+                                "ok": false,
+                                "status": "error",
+                                "message": e.to_string()
+                            }).to_string());
+                        }
                     }
                 }
             }
             Err(e) => {
                 error!(id = %id, error = %e, "failed to spawn MCP host");
+                if let Some(tx) = &events {
+                    let _ = tx.send(serde_json::json!({
+                        "event": "host_health",
+                        "id": id,
+                        "ok": false,
+                        "status": "spawn_failed",
+                        "message": e.to_string()
+                    }).to_string());
+                }
             }
         }
 
         // Backoff before restart
         warn!(id = %id, backoff_ms, "restarting MCP host after backoff");
-        if let Some(tx) = &events { let _ = tx.send(format!("[{}] restarting after backoff {}ms", id, backoff_ms)); }
+        if let Some(tx) = &events {
+            let _ = tx.send(serde_json::json!({
+                "event": "host_health",
+                "id": id,
+                "ok": false,
+                "status": "restarting",
+                "backoff_ms": backoff_ms
+            }).to_string());
+        }
         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
         backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
     }
@@ -545,6 +675,37 @@ async fn run_migrations(dsn: &str) -> anyhow::Result<()> {
             tags TEXT,
             created_at TIMESTAMPTZ DEFAULT now()
         );
+
+        -- MVP: persist trimmed stdout/stderr snippets for steps
+        ALTER TABLE steps ADD COLUMN IF NOT EXISTS stdout_snip TEXT;
+        ALTER TABLE steps ADD COLUMN IF NOT EXISTS stderr_snip TEXT;
+
+        -- Artifacts and attachments for richer step outputs
+        CREATE TABLE IF NOT EXISTS artifacts (
+          id BIGSERIAL PRIMARY KEY,
+          run_id BIGINT REFERENCES runs(id) ON DELETE CASCADE,
+          step_id BIGINT REFERENCES steps(id) ON DELETE CASCADE,
+          kind TEXT NOT NULL,
+          path TEXT,
+          mime TEXT,
+          size_bytes BIGINT,
+          checksum TEXT,
+          created_at TIMESTAMPTZ DEFAULT now()
+        );
+
+        CREATE TABLE IF NOT EXISTS step_attachments (
+          id BIGSERIAL PRIMARY KEY,
+          step_id BIGINT REFERENCES steps(id) ON DELETE CASCADE,
+          name TEXT NOT NULL,
+          content_json JSONB,
+          content_text TEXT,
+          created_at TIMESTAMPTZ DEFAULT now()
+        );
+
+        -- Helpful indexes
+        CREATE INDEX IF NOT EXISTS idx_metrics_run_key ON metrics(run_id, key);
+        CREATE INDEX IF NOT EXISTS idx_steps_execution_idx ON steps(execution_id, idx);
+        CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts(run_id);
     "#;
     client.batch_execute(stmts).await?;
     Ok(())

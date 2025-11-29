@@ -1,5 +1,5 @@
 [package]
-name = "claritas_mcp_clarium"
+name = "claritasai-agents"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,9 +7,7 @@ edition = "2021"
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-clap = { workspace = true }
 tokio = { workspace = true }
-tokio-postgres = { workspace = true }
-regex = "1"
+tracing = { workspace = true }
+reqwest = { workspace = true }
+claritasai-core = { path = "../claritasai-core" }
