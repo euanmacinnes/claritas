@@ -1,6 +1,8 @@
 use clap::Parser;
-use serde_json::json;
-use tracing::info;
+use serde_json::{json, Value};
+use tokio::{io::{AsyncBufReadExt, AsyncWriteExt, BufReader}, select};
+use tracing::{error, info};
+use tokio_postgres as pg;
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -44,7 +46,353 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    info!(dsn = ?cli.dsn, spec = ?cli.spec, "claritas_mcp_clarium started (stub)");
-    tokio::signal::ctrl_c().await?;
+    info!(dsn = ?cli.dsn, spec = ?cli.spec, "claritas_mcp_clarium starting JSON-RPC (stdio)");
+    let mut stdin = BufReader::new(tokio::io::stdin());
+    let mut stdout = tokio::io::stdout();
+    let mut buf = String::new();
+
+    loop {
+        buf.clear();
+        select! {
+            read_res = stdin.read_line(&mut buf) => {
+                match read_res {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if let Err(e) = handle_line(&buf, &mut stdout, cli.dsn.clone(), cli.spec.clone()).await { error!(error=%e, "handler error"); }
+                    }
+                    Err(e) => { error!(error=%e, "stdin read error"); break; }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => { break; }
+        }
+    }
+
     Ok(())
+}
+
+async fn handle_line(
+    line: &str,
+    stdout: &mut tokio::io::Stdout,
+    dsn: Option<String>,
+    _spec: Option<String>,
+) -> anyhow::Result<()> {
+    let req: Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => return Ok(()) };
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    let params = req.get("params").cloned().unwrap_or(json!({}));
+
+    let result = match method {
+        "meta.ping" => json!({"ok": true, "name": "claritas_mcp_clarium"}),
+        "meta.capabilities" => json!({"tools":[
+            "clarium.generate_sql","clarium.validate_sql","clarium.parse","clarium.execute",
+            "db.schema.inspect","db.schema.diff","db.index.suggest","db.query.explain"
+        ]}),
+        "clarium.validate_sql" => {
+            // Validate SQL by using PREPARE against the configured Postgres DSN
+            let sql = params.get("sql").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(ref dsn_s) = dsn {
+                match validate_with_postgres(dsn_s, sql).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if let Some(db) = e.downcast_ref::<pg::Error>() {
+                            json!({"ok": false, "error": db_error_json(db)})
+                        } else {
+                            json!({"ok": false, "error": {"message": e.to_string()}})
+                        }
+                    },
+                }
+            } else {
+                json!({"ok": false, "error": "missing DSN for clarium.validate_sql"})
+            }
+        }
+        "clarium.parse" => {
+            // Use EXPLAIN (PARSE only) equivalent by asking Postgres for a plan without execution
+            let sql = params.get("sql").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(ref dsn_s) = dsn {
+                match explain_with_postgres(dsn_s, sql, false).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if let Some(db) = e.downcast_ref::<pg::Error>() {
+                            json!({"ok": false, "error": db_error_json(db)})
+                        } else {
+                            json!({"ok": false, "error": {"message": e.to_string()}})
+                        }
+                    },
+                }
+            } else {
+                json!({"ok": false, "error": "missing DSN for clarium.parse"})
+            }
+        }
+        "clarium.execute" => {
+            // Execute SQL with row limiting. Params may include { sql, limit }
+            let sql = params.get("sql").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as i64;
+            if let Some(ref dsn_s) = dsn {
+                match execute_with_postgres(dsn_s, sql, limit).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if let Some(db) = e.downcast_ref::<pg::Error>() {
+                            json!({"ok": false, "error": db_error_json(db)})
+                        } else {
+                            json!({"ok": false, "error": {"message": e.to_string()}})
+                        }
+                    },
+                }
+            } else {
+                json!({"ok": false, "error": "missing DSN for clarium.execute"})
+            }
+        }
+        "db.query.explain" => {
+            // Params: { sql: string, analyze?: bool }
+            let sql = params.get("sql").and_then(|v| v.as_str()).unwrap_or("");
+            let analyze = params.get("analyze").and_then(|v| v.as_bool()).unwrap_or(false);
+            if let Some(ref dsn_s) = dsn {
+                match explain_with_postgres(dsn_s, sql, analyze).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if let Some(db) = e.downcast_ref::<pg::Error>() {
+                            json!({"ok": false, "error": db_error_json(db)})
+                        } else {
+                            json!({"ok": false, "error": {"message": e.to_string()}})
+                        }
+                    },
+                }
+            } else {
+                json!({"ok": false, "error": "missing DSN for db.query.explain"})
+            }
+        }
+        "db.schema.inspect" => {
+            if let Some(ref dsn_s) = dsn {
+                match inspect_schemas(dsn_s).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if let Some(db) = e.downcast_ref::<pg::Error>() {
+                            json!({"ok": false, "error": db_error_json(db)})
+                        } else {
+                            json!({"ok": false, "error": {"message": e.to_string()}})
+                        }
+                    },
+                }
+            } else {
+                json!({"ok": false, "error": "missing DSN for db.schema.inspect"})
+            }
+        }
+        "db.schema.diff" => {
+            // Compare schemas (tables and columns) between two schema names
+            // Params: { left: string, right: string }
+            let left = params.get("left").and_then(|v| v.as_str()).unwrap_or("");
+            let right = params.get("right").and_then(|v| v.as_str()).unwrap_or("");
+            if left.is_empty() || right.is_empty() {
+                json!({"ok": false, "error": "params {left,right} are required"})
+            } else if let Some(ref dsn_s) = dsn {
+                match diff_schemas(dsn_s, left, right).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if let Some(db) = e.downcast_ref::<pg::Error>() {
+                            json!({"ok": false, "error": db_error_json(db)})
+                        } else {
+                            json!({"ok": false, "error": {"message": e.to_string()}})
+                        }
+                    },
+                }
+            } else {
+                json!({"ok": false, "error": "missing DSN for db.schema.diff"})
+            }
+        }
+        _ => json!({"error": {"code": -32601, "message": format!("method not found: {}", method)}}),
+    };
+
+    let resp = json!({"id": id, "result": result});
+    let s = serde_json::to_string(&resp)?;
+    stdout.write_all(s.as_bytes()).await?;
+    stdout.write_all(b"\n").await?;
+    stdout.flush().await?;
+    Ok(())
+}
+
+// --- Postgres helpers (placeholder/simple) ---
+
+async fn validate_with_postgres(dsn: &str, sql: &str) -> anyhow::Result<Value> {
+    // Use PREPARE to validate syntax and types without executing
+    let (client, conn) = pg::connect(dsn, pg::NoTls).await?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let stmt_text = format!("PREPARE claritasai_tmp AS {}", sql);
+    let res = client.batch_execute(&stmt_text).await;
+    // Try to DEALLOCATE even if prepare failed
+    let _ = client.batch_execute("DEALLOCATE ALL").await;
+    match res {
+        Ok(_) => Ok(json!({"ok": true})),
+        Err(e) => {
+            if let Some(db) = e.as_db_error() {
+                Ok(json!({"ok": false, "error": db_error_json_from_db(db)}))
+            } else {
+                Ok(json!({"ok": false, "error": {"message": e.to_string()}}))
+            }
+        },
+    }
+}
+
+async fn explain_with_postgres(dsn: &str, sql: &str, analyze: bool) -> anyhow::Result<Value> {
+    let (client, conn) = pg::connect(dsn, pg::NoTls).await?;
+    tokio::spawn(async move { let _ = conn.await; });
+    let prefix = if analyze { "EXPLAIN (ANALYZE, VERBOSE, COSTS) " } else { "EXPLAIN (VERBOSE, COSTS) " };
+    let q = format!("{}{}", prefix, sql);
+    let rows = client.query(q.as_str(), &[]).await?;
+    let mut plan_lines: Vec<String> = Vec::new();
+    for r in rows { let txt: &str = r.get(0); plan_lines.push(txt.to_string()); }
+    Ok(json!({"ok": true, "plan": plan_lines}))
+}
+
+async fn execute_with_postgres(dsn: &str, sql: &str, limit: i64) -> anyhow::Result<Value> {
+    use tokio::time::Instant;
+    let start = Instant::now();
+    let (client, conn) = pg::connect(dsn, pg::NoTls).await?;
+    tokio::spawn(async move { let _ = conn.await; });
+    // Wrap in a CTE to enforce limit if it's a SELECT; otherwise just execute
+    let trimmed = sql.trim().to_ascii_lowercase();
+    if trimmed.starts_with("select") {
+        let q = format!("WITH _q AS ({}) SELECT * FROM _q LIMIT {}", sql, limit);
+        let rows = client.query(q.as_str(), &[]).await?;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        // Convert rows to JSON-ish arrays (textual)
+        let mut out_rows: Vec<Vec<String>> = Vec::new();
+        for row in rows {
+            let mut cols: Vec<String> = Vec::new();
+            for i in 0..row.len() {
+                let v: Result<String, _> = row.try_get(i);
+                cols.push(v.unwrap_or_else(|_| "<unrepr>".into()));
+            }
+            out_rows.push(cols);
+        }
+        Ok(json!({"ok": true, "rows": out_rows, "elapsed_ms": elapsed_ms}))
+    } else {
+        // Non-select: just execute and return rows_affected
+        let res = client.batch_execute(sql).await;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        match res {
+            Ok(_) => Ok(json!({"ok": true, "elapsed_ms": elapsed_ms})),
+            Err(e) => {
+                if let Some(db) = e.as_db_error() {
+                    Ok(json!({"ok": false, "error": db_error_json_from_db(db)}))
+                } else {
+                    Ok(json!({"ok": false, "error": {"message": e.to_string()}}))
+                }
+            },
+        }
+    }
+}
+
+async fn inspect_schemas(dsn: &str) -> anyhow::Result<Value> {
+    let (client, conn) = pg::connect(dsn, pg::NoTls).await?;
+    tokio::spawn(async move { let _ = conn.await; });
+    let rows = client
+        .query(
+            "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name",
+            &[],
+        )
+        .await?;
+    let mut schemas: Vec<String> = Vec::new();
+    for r in rows {
+        let s: &str = r.get(0);
+        schemas.push(s.to_string());
+    }
+    Ok(json!({"ok": true, "schemas": schemas}))
+}
+
+async fn diff_schemas(dsn: &str, left: &str, right: &str) -> anyhow::Result<Value> {
+    // Fetch tables and columns for both schemas and compute set diffs
+    let (client, conn) = pg::connect(dsn, pg::NoTls).await?;
+    tokio::spawn(async move { let _ = conn.await; });
+
+    // helper to get tables
+    async fn get_tables(client: &pg::Client, schema: &str) -> anyhow::Result<Vec<String>> {
+        let rows = client
+            .query(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = $1 ORDER BY table_name",
+                &[&schema],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| r.get::<_, &str>(0).to_string()).collect())
+    }
+
+    // helper to get columns map: table -> [columns]
+    async fn get_columns(client: &pg::Client, schema: &str) -> anyhow::Result<std::collections::HashMap<String, Vec<String>>> {
+        let rows = client
+            .query(
+                "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = $1 ORDER BY table_name, ordinal_position",
+                &[&schema],
+            )
+            .await?;
+        let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for r in rows {
+            let t: &str = r.get(0);
+            let c: &str = r.get(1);
+            map.entry(t.to_string()).or_default().push(c.to_string());
+        }
+        Ok(map)
+    }
+
+    let left_tables = get_tables(&client, left).await?;
+    let right_tables = get_tables(&client, right).await?;
+
+    let left_set: std::collections::HashSet<_> = left_tables.iter().cloned().collect();
+    let right_set: std::collections::HashSet<_> = right_tables.iter().cloned().collect();
+
+    let tables_only_left: Vec<String> = left_set.difference(&right_set).cloned().collect();
+    let tables_only_right: Vec<String> = right_set.difference(&left_set).cloned().collect();
+    let tables_common: Vec<String> = left_set.intersection(&right_set).cloned().collect();
+
+    let left_cols = get_columns(&client, left).await?;
+    let right_cols = get_columns(&client, right).await?;
+
+    // column diffs for common tables
+    let mut column_diffs: Vec<Value> = Vec::new();
+    for t in tables_common.iter() {
+        let lcols: std::collections::HashSet<String> = left_cols.get(t).cloned().unwrap_or_default().into_iter().collect();
+        let rcols: std::collections::HashSet<String> = right_cols.get(t).cloned().unwrap_or_default().into_iter().collect();
+        let only_left: Vec<String> = lcols.difference(&rcols).cloned().collect();
+        let only_right: Vec<String> = rcols.difference(&lcols).cloned().collect();
+        if !only_left.is_empty() || !only_right.is_empty() {
+            column_diffs.push(json!({
+                "table": t,
+                "columns_only_left": only_left,
+                "columns_only_right": only_right
+            }));
+        }
+    }
+
+    Ok(json!({
+        "ok": true,
+        "left": left,
+        "right": right,
+        "tables_only_left": tables_only_left,
+        "tables_only_right": tables_only_right,
+        "column_diffs": column_diffs
+    }))
+}
+
+// --- Error normalization helpers ---
+fn db_error_json(err: &pg::Error) -> serde_json::Value {
+    if let Some(db) = err.as_db_error() {
+        db_error_json_from_db(db)
+    } else {
+        json!({"message": err.to_string()})
+    }
+}
+
+fn db_error_json_from_db(db: &pg::error::DbError) -> serde_json::Value {
+    let code = db.code().code().to_string();
+    let severity = db.severity().to_string();
+    let message = db.message().to_string();
+    let detail = db.detail().map(|s| s.to_string());
+    let hint = db.hint().map(|s| s.to_string());
+    json!({
+        "sqlstate": code,
+        "severity": severity,
+        "message": message,
+        "detail": detail,
+        "hint": hint,
+    })
 }

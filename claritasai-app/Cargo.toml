@@ -13,3 +13,6 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 claritasai-web = { path = "../claritasai-web" }
+claritasai-mcp = { path = "../claritasai-mcp" }
+tokio-postgres = { workspace = true }
+url = { workspace = true }

@@ -13,3 +13,9 @@ hyper = { workspace = true }
 tower = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+claritasai-mcp = { path = "../claritasai-mcp" }
+htmlescape = "0.3"
+tokio-postgres = { workspace = true }
+claritasai-plan = { path = "../claritasai-plan" }
+claritasai-verify = { path = "../claritasai-verify" }
+claritasai-core = { path = "../claritasai-core" }
