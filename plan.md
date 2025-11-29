@@ -24,6 +24,35 @@ This document captures the current state of implementation for the Rust-based Cl
 - Planner drafts a multi-step plan: meta.ping, python.lint, rust.cargo.build.debug, clarium.validate_sql.
 - Build is green across workspace.
 
+## 3) Priority focus: Self‑development via Rust API and multi‑role LLM planning
+Goals: Enable Claritas to improve itself using its Rust API and MCP tools, guided by an LLM planning stack with three coordinated roles.
+
+Roles and loop (dual‑personality + manager):
+- Professional Developer (Dev): proposes designs/architectures and detailed implementation plans; selects tools and produces patches/specs.
+- Professional Systems Tester / QA (QA): expands/validates the plan; defines acceptance tests, edge cases, and risk checks; blocks unsafe/underspecified work.
+- Professional Software Engineering Manager (Mgr): enforces scope, milestones, and quality bars; arbitrates Dev↔QA disagreements; keeps execution on track.
+
+Key capabilities to build:
+- Rust self‑development API
+  - High‑level operations: code.generate, code.edit (structured patches), code.refactor.*, fs.* with safety (dry‑run, diff, rollback).
+  - Project graph & impact analysis (Rust and Python): parse Cargo workspace, map crates/files/tests; for Python, infer modules/tests.
+  - Test scaffolding: create unit/integration tests and harness wiring; link to metrics collection.
+- Enhanced planning via LLM+MCP
+  - Planner uses MCP chat tools (OpenAI/Ollama) with retrieval from memories; auto‑discovers tools via meta.capabilities and builds executable Plans with assertions and rollback.
+  - Verifier (QA) performs structured critique; returns PlanVerdict with required_changes; can auto‑author tests.
+  - Manager role manages OKRs: objective → milestones → steps, enforces budgets/timeouts, and resumes runs on interruptions.
+- Memory‑driven learning
+  - Write outcome summaries, diffs, and test artifacts to global/project memories; retrieve top‑k relevant memories into prompts for Dev/QA/Mgr.
+- Safety & governance
+  - Guardrails: dry‑run first, require QA approval before write operations, and Mgr approval for scope/budget changes.
+  - Audit trail: persist decisions, diffs, tests, and verdicts.
+
+Deliverables for this focus:
+- New agents: DevAgent, QAAgent, ManagerAgent (Rust), orchestrated in runtime; optional Lua hooks later.
+- Planning protocol JSON schemas: Plan{assumptions, constraints, risks, steps, assertions, rollback}, PlanVerdict{status, rationale, required_changes[]}.
+- Patch application toolchain: unified diff/structured edits with validation (compiles/tests before commit), rollback on failure.
+- UI: role‑tagged messages and approvals, milestone progress, and prompts for user input when blocking.
+
 ## 3) Remaining actions (near-term)
 1. UI timeline and streaming enhancements
    - Live step cards with status, timestamps, stdout/stderr panes via SSE. [UI]
@@ -64,6 +93,16 @@ This document captures the current state of implementation for the Rust-based Cl
    - Config validation with clear diagnostics; precedence rules (CLI vs YAML). [App]
    - README/Quickstart; ops guide for remote MCP mode. [Docs]
 
+12. Multi‑role planning orchestration (Dev/QA/Mgr)
+    - Implement DevAgent, QAAgent, ManagerAgent with explicit contracts and prompts; wire to MCP chat providers. [Runtime]
+    - Add planning loop: Dev drafts → QA critiques (NeedsChanges with diffs/tests) → repeat until Approved → Mgr signs off per milestone. [Runtime]
+    - Persist role messages, decisions, and change requests; expose in UI. [Web/DB]
+
+13. Self‑development patch pipeline
+    - Add structured patch model (unified diff and AST‑aware edits where available). [Core]
+    - Pre‑commit checks: compile/tests/lints; auto‑rollback on failures; metrics emitted. [Runtime]
+    - Safe write gates: require QA Approve and Mgr OK for scope/risk changes. [Runtime]
+
 ## 4) Deferred / re-implement later
 - Replace stub Verifier with LLM-assisted verifier via configured MCP chat tools.
 - Advanced planner using retrieval-augmented prompts and tool discovery from capabilities.
@@ -84,6 +123,11 @@ This document captures the current state of implementation for the Rust-based Cl
 - [ ] Tool detection helpers and user-friendly errors when tools are missing.
 - [ ] CI workflows for Windows/Linux/macOS; smoke test job.
 - [ ] CLI help texts and config validation errors; document CLI vs YAML precedence.
+- [ ] Implement DevAgent, QAAgent, ManagerAgent with MCP chat connectors and prompts.
+- [ ] Implement planning loop with NeedsChanges cycle and milestone sign‑off.
+- [ ] Introduce structured patch model and guarded apply (dry‑run, diff preview, rollback).
+- [ ] Add project graph/impact analysis (Cargo workspaces; Python modules/tests discovery).
+- [ ] Persist role transcripts and decisions; render role timeline in UI.
 
 ## 6) Risks and notes
 - External tools may be unavailable; provide clear guidance and fallbacks.
