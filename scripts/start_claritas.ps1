@@ -41,7 +41,7 @@
 param(
   [string]$Config = ".\configs\claritasai.yaml",
   [string]$Bind = "127.0.0.1:7040",
-  [string]$ClariumDsn = $env:CLARIUM_DSN,
+  [string]$ClariumDsn = $(if ($env:CLARIUM_DSN) { $env:CLARIUM_DSN } else { 'postgres://claritas:claritas@localhost:5433/claritas?sslmode=disable' }),
   [string]$ClariumSpec,
   [switch]$Build,
   [switch]$CheckOllama,
