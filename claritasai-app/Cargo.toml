@@ -12,8 +12,10 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
+serde_json = { workspace = true }
 claritasai-web = { path = "../claritasai-web" }
 claritasai-mcp = { path = "../claritasai-mcp" }
 tokio-postgres = { workspace = true }
 url = { workspace = true }
 claritasai-agents = { path = "../claritasai-agents" }
+claritasai-notify = { path = "../claritasai-notify" }

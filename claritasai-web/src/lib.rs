@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Form, State, Path},
+    extract::{Form, State, Path as AxPath},
     response::{Html, IntoResponse, Sse},
     response::sse::Event,
     routing::get,
@@ -21,10 +21,11 @@ use tokio_stream::wrappers::BroadcastStream;
 use claritasai_notify::{NotifierHub, NotifyMessage};
 use serde::{Serialize, Deserialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Path as FsPath, PathBuf};
 use tokio::fs as tfs;
 use axum::Json;
 use axum::http::{HeaderMap, header, StatusCode};
+use sha2::{Sha256, Digest};
 
 #[derive(Clone, Default)]
 pub struct WebState {
@@ -37,12 +38,16 @@ pub struct WebState {
     pub event_tx: Option<broadcast::Sender<String>>, // for SSE streaming
     pub tool_registry: Option<ToolRegistry>,
     pub db_dsn: Option<String>,
-    pub notifier_hub: Option<NotifierHub>,
+    pub notifier_hub: Option<Arc<NotifierHub>>,
     // Streaming controls (can be configured via env/CLI upstream):
     pub partial_chunk_size: usize,   // default 1024
     pub partial_max_chunks: usize,   // default 3
     // Optional multi-agent harness (Ollama-backed)
     pub agents: Option<AgentsHarness>,
+    // Agent config
+    pub agents_max_attempts: Option<usize>,
+    // Executor config
+    pub step_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +66,10 @@ struct SseEvent {
     #[serde(skip_serializing_if = "Option::is_none")] has_more: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")] stdout_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")] stderr_bytes: Option<u64>,
+    // Agent timeline support
+    #[serde(skip_serializing_if = "Option::is_none")] role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] json: Option<serde_json::Value>,
 }
 
 pub fn router(state: Arc<WebState>) -> Router {
@@ -68,13 +77,33 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/health", get(health))
         .route("/chat", get(chat_get).post(chat_post))
         .route("/chat/stream", get(chat_stream))
+        .route("/db/check", get(db_check))
         .route("/runs/:id/metrics", get(metrics_get))
         .route("/runs/:id/artifacts", get(run_artifacts_get))
         .route("/artifacts/:id", get(artifact_download))
+        .route("/memories", get(memories_list))
         .with_state(state)
 }
 
 async fn health() -> &'static str { "OK" }
+
+// Simple DB connectivity self-check endpoint
+async fn db_check(State(state): State<Arc<WebState>>) -> impl IntoResponse {
+    if let Some(dsn) = &state.db_dsn {
+        match pg::connect(dsn, pg::NoTls).await {
+            Ok((client, conn)) => {
+                tokio::spawn(async move { let _ = conn.await; });
+                match client.query_one("SELECT 1", &[]).await {
+                    Ok(_) => return Json(json!({"ok": true})),
+                    Err(e) => return Json(json!({"ok": false, "message": format!("query failed: {}", e)})),
+                }
+            }
+            Err(e) => Json(json!({"ok": false, "message": e.to_string()})),
+        }
+    } else {
+        Json(json!({"ok": false, "message": "DB not configured"}))
+    }
+}
 
 async fn chat_get() -> Html<&'static str> {
     Html(r##"<!doctype html>
@@ -140,7 +169,7 @@ async fn chat_get() -> Html<&'static str> {
         banner.style.display = 'block';
         banner.style.background = data.ok ? '#e6ffed' : '#ffecec';
         banner.style.color = data.ok ? '#0a5' : '#a00';
-        banner.textContent = data.ok ? 'DB: connected' : ('DB: '+(data.message||'not configured'));
+        banner.innerHTML = data.ok ? 'DB: connected' : ('DB: '+(data.message||'not configured')+ ' — <a href="/db/check" target="_blank">check</a>');
         return;
       }
       if(data.event === 'host_health'){
@@ -166,6 +195,24 @@ async fn chat_get() -> Html<&'static str> {
         const div = document.createElement('div');
         div.innerHTML = '<span style="color:#555;">Verdict:</span> '+esc(data.status||'')+' — '+esc(data.message||'');
         steps.appendChild(div);
+        return;
+      }
+      if(data.event === 'agent_message'){
+        const steps = ensureRun(data.run_id);
+        const card = document.createElement('div');
+        card.style.border = '1px dashed #ccc';
+        card.style.borderRadius = '6px';
+        card.style.padding = '6px';
+        card.style.margin = '6px 0';
+        const role = esc(data.role||'?');
+        const stage = esc(data.stage||'');
+        let body = esc(data.message||'');
+        if(!body && data.json){
+          try { body = JSON.stringify(data.json); } catch(_) {}
+        }
+        card.innerHTML = '<div style="font-weight:bold;">'+role+(stage?(' · '+stage):'')+'</div>'+
+                         '<div style="white-space:pre-wrap;">'+body+'</div>';
+        steps.appendChild(card);
         return;
       }
       if(data.event === 'execution_started'){
@@ -253,14 +300,22 @@ async fn chat_get() -> Html<&'static str> {
             box.style.borderTop = '1px dashed #ddd';
             box.style.paddingTop = '6px';
             let html = '<div style="font-weight:bold;">Artifacts</div><ul style="margin:4px 0; padding-left:20px;">';
-            html += arts.map(a=>'<li>'+a.kind+' — '+(a.size_bytes||'?')+' bytes — <a target="_blank" href="'+a.href+'">download</a></li>').join('');
+            html += arts.map(a=>{
+              const parts = [];
+              parts.push(a.kind||'artifact');
+              if (a.mime) parts.push('mime: '+a.mime);
+              if (typeof a.size_bytes === 'number') parts.push(String(a.size_bytes)+' bytes');
+              if (a.checksum) parts.push('sha256: '+a.checksum.substring(0,12)+'…');
+              parts.push('<a target="_blank" href="'+a.href+'">download</a>');
+              return '<li>'+parts.join(' — ')+'</li>';
+            }).join('');
             html += '</ul>';
             box.innerHTML = html;
             steps.appendChild(box);
           }
         }).catch(()=>{});
-        return;
-      }
+          return;
+        }
     });
   })();
 </script>
@@ -269,14 +324,14 @@ async fn chat_get() -> Html<&'static str> {
 
 // --- Artifact endpoints ---
 async fn run_artifacts_get(
-    State(state): State<Arc<WebState>>,
-    Path(run_id): Path<i64>,
+    State(state): State<Arc<WebState>>, 
+    AxPath(run_id): AxPath<i64>,
 ) -> impl IntoResponse {
     let mut items: Vec<serde_json::Value> = Vec::new();
     if let Some(dsn) = &state.db_dsn {
         if let Ok((client, conn)) = pg::connect(dsn, pg::NoTls).await {
             tokio::spawn(async move { let _ = conn.await; });
-            let q = "SELECT id, kind, path, mime, size_bytes, created_at::text FROM artifacts WHERE run_id = $1 ORDER BY id";
+            let q = "SELECT id, kind, path, mime, size_bytes, checksum, created_at::text FROM artifacts WHERE run_id = $1 ORDER BY id";
             if let Ok(rows) = client.query(q, &[&run_id]).await {
                 for r in rows {
                     let id: i64 = r.get(0);
@@ -284,13 +339,15 @@ async fn run_artifacts_get(
                     let path: Option<String> = r.try_get(2).ok();
                     let mime: Option<String> = r.try_get(3).ok();
                     let size: Option<i64> = r.try_get(4).ok();
-                    let created_at: Option<String> = r.try_get(5).ok();
+                    let checksum: Option<String> = r.try_get(5).ok();
+                    let created_at: Option<String> = r.try_get(6).ok();
                     items.push(json!({
                         "id": id,
                         "kind": kind,
                         "path": path,
                         "mime": mime,
                         "size_bytes": size,
+                        "checksum": checksum,
                         "created_at": created_at,
                         "href": format!("/artifacts/{}", id),
                     }));
@@ -302,8 +359,8 @@ async fn run_artifacts_get(
 }
 
 async fn artifact_download(
-    State(state): State<Arc<WebState>>,
-    Path(artifact_id): Path<i64>,
+    State(state): State<Arc<WebState>>, 
+    AxPath(artifact_id): AxPath<i64>,
 ) -> impl IntoResponse {
     if let Some(dsn) = &state.db_dsn {
         if let Ok((client, conn)) = pg::connect(dsn, pg::NoTls).await {
@@ -331,6 +388,72 @@ async fn artifact_download(
     (StatusCode::NOT_FOUND, "artifact not found").into_response()
 }
 
+// --- Memory helpers and endpoint ---
+async fn memory_write(
+    client: &pg::Client,
+    project_key: &str,
+    kind: &str,
+    key: &str,
+    content: &str,
+    tags: &str,
+) {
+    let _ = client
+        .query(
+            "INSERT INTO project_memories(project_key, kind, key, content, tags) VALUES($1,$2,$3,$4,$5)",
+            &[&project_key, &kind, &key, &content, &tags],
+        )
+        .await;
+}
+
+async fn memory_query(
+    client: &pg::Client,
+    project_key: &str,
+    tags_like: Option<&str>,
+    k: i64,
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let q_all = "SELECT id, kind, key, content, tags, created_at::text FROM project_memories WHERE project_key=$1 ORDER BY id DESC LIMIT $2";
+    let q_tag = "SELECT id, kind, key, content, tags, created_at::text FROM project_memories WHERE project_key=$1 AND tags ILIKE $2 ORDER BY id DESC LIMIT $3";
+    let rows = if let Some(t) = tags_like {
+        client
+            .query(q_tag, &[&project_key, &t, &k])
+            .await
+            .unwrap_or_default()
+    } else {
+        client
+            .query(q_all, &[&project_key, &k])
+            .await
+            .unwrap_or_default()
+    };
+    for r in rows {
+        let id: i64 = r.get(0);
+        let kind: String = r.get(1);
+        let key: String = r.get(2);
+        let content: String = r.get(3);
+        let tags: String = r.get(4);
+        let created_at: Option<String> = r.try_get(5).ok();
+        out.push(json!({"id": id, "kind": kind, "key": key, "content": content, "tags": tags, "created_at": created_at}));
+    }
+    out
+}
+
+async fn memories_list(State(state): State<Arc<WebState>>, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let project = params.get("project").cloned().unwrap_or_else(|| "default".to_string());
+    let tags = params.get("tags").cloned();
+    let k: i64 = params
+        .get("k")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(10);
+    if let Some(dsn) = &state.db_dsn {
+        if let Ok((client, conn)) = pg::connect(dsn, pg::NoTls).await {
+            tokio::spawn(async move { let _ = conn.await; });
+            let items = memory_query(&client, &project, tags.as_deref(), k).await;
+            return Json(json!({"ok": true, "project": project, "count": items.len(), "items": items}));
+        }
+    }
+    Json(json!({"ok": false, "message": "DB not configured"}))
+}
+
 // --- DB helpers for artifacts ---
 async fn fetch_step_id_for(client: &pg::Client, run_id: Option<i64>, step_idx: i32) -> Result<i64, String> {
     let rid = run_id.ok_or_else(|| "missing run_id".to_string())?;
@@ -350,18 +473,39 @@ async fn fetch_step_id_for(client: &pg::Client, run_id: Option<i64>, step_idx: i
     }
 }
 
-async fn write_artifact_file(run_id: Option<i64>, step_id: i64, kind: &str, content: &str) -> Result<String, String> {
+/// Naive MIME detection and file naming based on content/kind.
+fn detect_mime_and_filename(kind: &str, content: &str) -> (String, String) {
+    // Try JSON first
+    let trimmed = content.trim_start();
+    if (trimmed.starts_with('{') || trimmed.starts_with('[')) && serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return (format!("{}.json", kind), "application/json".to_string());
+    }
+    // Minimal HTML check
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("<html") || lower.contains("<body") || lower.contains("<!doctype html") {
+        return (format!("{}.html", kind), "text/html".to_string());
+    }
+    // Plain text fallback
+    (format!("{}.txt", kind), "text/plain".to_string())
+}
+
+async fn write_artifact_file(run_id: Option<i64>, step_id: i64, kind: &str, content: &str) -> Result<(String, String, String), String> {
     let rid = run_id.ok_or_else(|| "missing run_id".to_string())?;
     let mut base = std::env::current_dir().map_err(|e| e.to_string())?;
     base.push("files");
     base.push("artifacts");
     base.push(format!("run_{}", rid));
     if let Err(e) = tfs::create_dir_all(&base).await { return Err(e.to_string()); }
-    let filename = format!("step_{}_{}.txt", step_id, kind);
+    let (basename, mime) = detect_mime_and_filename(kind, content);
+    let filename = format!("step_{}_{}", step_id, basename);
     let mut path = base.clone();
     path.push(filename);
     if let Err(e) = tfs::write(&path, content.as_bytes()).await { return Err(e.to_string()); }
-    Ok(path.to_string_lossy().to_string())
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    let digest = hasher.finalize();
+    let checksum = hex::encode(digest);
+    Ok((path.to_string_lossy().to_string(), checksum, mime))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -389,6 +533,8 @@ async fn chat_post(
         if let Some(dsn) = &state.db_dsn {
             if let Ok((client, conn)) = pg::connect(dsn, pg::NoTls).await {
                 tokio::spawn(async move { let _ = conn.await; });
+                // Ensure optional extension tables exist (best-effort)
+                let _ = ensure_optional_tables(&client).await;
                 db_client = Some(client);
                 if let Some(tx) = &state.event_tx {
                     let _ = tx.send(serde_json::json!({"event":"db_status","ok": true}).to_string());
@@ -408,12 +554,22 @@ async fn chat_post(
         // mark run start time for metrics
         let run_start = Instant::now();
         if let Some(tx) = &state.event_tx {
-            let _ = tx.send(serde_json::to_string(&SseEvent{ event: "run_started".into(), run_id, plan_steps: None, step_idx: None, tool: None, status: None, message: Some("planning started".into()), chunk: None, stream: None }).unwrap_or_else(|_| "{\"event\":\"run_started\"}".into()));
+            let _ = tx.send(serde_json::to_string(&SseEvent{ event: "run_started".into(), run_id, plan_steps: None, step_idx: None, tool: None, status: None, message: Some("planning started".into()), chunk: None, stream: None, snippet: None, has_more: None, stdout_bytes: None, stderr_bytes: None, role: None, stage: None, json: None }).unwrap_or_else(|_| "{\"event\":\"run_started\"}".into()));
         }
 
         // Draft plan (use agents if available)
+        // Load top-K memories for planning context
+        let mut planning_memories: Vec<serde_json::Value> = Vec::new();
+        if let Some(client) = db_client.as_ref() {
+            planning_memories = memory_query(client, "default", Some("%plan%"), 5).await;
+        }
+        let mem_text = if planning_memories.is_empty() { None } else {
+            let mut s = String::from("Relevant prior learnings:\n");
+            for it in &planning_memories { if let Some(c) = it.get("content").and_then(|v| v.as_str()) { s.push_str("- "); s.push_str(c); s.push('\n'); } }
+            Some(s)
+        };
         let plan = if let Some(agents) = &state.agents {
-            match agents.draft_plan(&form.objective).await {
+            match agents.draft_plan_with_context(&form.objective, mem_text.as_deref().unwrap_or("")) .await {
                 Ok(p) => p,
                 Err(e) => {
                     if let Some(tx) = &state.event_tx {
@@ -425,16 +581,60 @@ async fn chat_post(
         } else {
             planner.draft_plan(&form.objective)
         };
+        // Agent message: Dev plan draft (when agents are enabled)
+        if state.agents.is_some() {
+            if let Some(tx) = &state.event_tx {
+                let _ = tx.send(serde_json::to_string(&SseEvent{
+                    event: "agent_message".into(),
+                    run_id,
+                    plan_steps: None,
+                    step_idx: None,
+                    tool: None,
+                    status: Some("draft".into()),
+                    message: Some("DevAgent drafted plan".into()),
+                    chunk: None,
+                    stream: None,
+                    snippet: None,
+                    has_more: None,
+                    stdout_bytes: None,
+                    stderr_bytes: None,
+                    role: Some("Dev".into()),
+                    stage: Some("plan_draft".into()),
+                    json: Some(json!(plan)),
+                }).unwrap_or_else(|_| "{\"event\":\"agent_message\"}".into()));
+            }
+            // Persist a brief agent memory
+            if let Some(client) = db_client.as_mut() {
+                let _ = client.query(
+                    "INSERT INTO project_memories(project_key, kind, key, content, tags) VALUES($1,$2,$3,$4,$5)",
+                    &[&"default", &"agent", &format!("run:{:?}:dev:plan_draft", run_id), &"DevAgent drafted plan", &"agent,dev,plan" ]
+                ).await;
+                // Persist detailed agent message
+                let _ = client.query(
+                    "INSERT INTO agent_messages(run_id, role, stage, content, json) VALUES($1,$2,$3,$4,$5)",
+                    &[&run_id, &"Dev", &"plan_draft", &"DevAgent drafted plan", &json!(plan)]
+                ).await;
+            }
+        }
         if let Some(client) = db_client.as_mut() {
             let _ = client.query("INSERT INTO plans(run_id, objective, json) VALUES($1,$2,$3)", &[&run_id, &plan.objective, &json!(plan)]).await;
+            // Record initial plan revision as rev_no = 1 (best-effort)
+            let _ = client.query(
+                "INSERT INTO plan_revisions(run_id, rev_no, plan_json) VALUES($1,$2,$3)",
+                &[&run_id, &1i32, &json!(plan)]
+            ).await;
         }
         if let Some(tx) = &state.event_tx {
-            let _ = tx.send(serde_json::to_string(&SseEvent{ event: "plan_saved".into(), run_id, plan_steps: Some(plan.steps.len()), step_idx: None, tool: None, status: Some("ok".into()), message: None, chunk: None, stream: None }).unwrap_or_else(|_| "{\"event\":\"plan_saved\"}".into()));
+            let _ = tx.send(serde_json::to_string(&SseEvent{ event: "plan_saved".into(), run_id, plan_steps: Some(plan.steps.len()), step_idx: None, tool: None, status: Some("ok".into()), message: None, chunk: None, stream: None, snippet: None, has_more: None, stdout_bytes: None, stderr_bytes: None, role: None, stage: None, json: None }).unwrap_or_else(|_| "{\"event\":\"plan_saved\"}".into()));
         }
 
         // Verify (use agents QA + Manager if available)
         let verdict = if let Some(agents) = &state.agents {
-            let qa = match agents.review_plan(&plan).await {
+            // Prepare memories for QA stage
+            let mut qa_mems: Vec<serde_json::Value> = Vec::new();
+            if let Some(client) = db_client.as_ref() { qa_mems = memory_query(client, "default", Some("%qa%"), 5).await; }
+            let qa_mem_text = if qa_mems.is_empty() { "".to_string() } else { let mut s=String::from("Context:\n"); for it in &qa_mems { if let Some(c)=it.get("content").and_then(|v| v.as_str()){ s.push_str("- "); s.push_str(c); s.push('\n'); } } s };
+            let mut qa = match agents.review_plan_with_context(&plan, &qa_mem_text).await {
                 Ok(v) => v,
                 Err(e) => {
                     if let Some(tx) = &state.event_tx {
@@ -443,15 +643,211 @@ async fn chat_post(
                     verifier.review(&plan)
                 }
             };
-            match agents.manager_gate(&plan, &qa).await {
-                Ok(mv) => mv,
+            // Emit QA agent message
+            if let Some(tx) = &state.event_tx {
+                let _ = tx.send(serde_json::to_string(&SseEvent{
+                    event: "agent_message".into(),
+                    run_id,
+                    plan_steps: None,
+                    step_idx: None,
+                    tool: None,
+                    status: Some(qa.status.clone()),
+                    message: Some(qa.rationale.clone()),
+                    chunk: None,
+                    stream: None,
+                    snippet: None,
+                    has_more: None,
+                    stdout_bytes: None,
+                    stderr_bytes: None,
+                    role: Some("QA".into()),
+                    stage: Some("plan_review".into()),
+                    json: Some(json!(qa)),
+                }).unwrap_or_else(|_| "{\"event\":\"agent_message\"}".into()));
+            }
+            if let Some(client) = db_client.as_mut() {
+                let _ = client.query(
+                    "INSERT INTO project_memories(project_key, kind, key, content, tags) VALUES($1,$2,$3,$4,$5)",
+                    &[&"default", &"agent", &format!("run:{:?}:qa:review", run_id), &format!("{}: {}", qa.status, qa.rationale), &"agent,qa,review" ]
+                ).await;
+                let _ = client.query(
+                    "INSERT INTO agent_messages(run_id, role, stage, content, json) VALUES($1,$2,$3,$4,$5)",
+                    &[&run_id, &"QA", &"plan_review", &qa.rationale, &json!(qa)]
+                ).await;
+            }
+            // Bounded Dev <-> QA refinement loop when QA requests changes
+            let mut plan_current = plan.clone();
+            let mut rev_no: i32 = 1;
+            let max_attempts: usize = state.agents_max_attempts.unwrap_or(2);
+            let mut attempts: usize = 0;
+            while qa.status.eq_ignore_ascii_case("NeedsChanges") && attempts < max_attempts {
+                attempts += 1;
+                let changes: Vec<String> = qa.required_changes.clone().unwrap_or_default();
+                // Ask Dev to refine plan
+                let refine_mem = if let Some(client) = db_client.as_ref() { memory_query(client, "default", Some("%plan%"), 3).await } else { Vec::new() };
+                let refine_ctx = if refine_mem.is_empty() { String::new() } else { let mut s=String::new(); for it in &refine_mem { if let Some(c)=it.get("content").and_then(|v| v.as_str()){ s.push_str("- "); s.push_str(c); s.push('\n'); } } s };
+                match agents.refine_plan_with_context(&plan_current, &changes, &refine_ctx).await {
+                    Ok(new_plan) => {
+                        plan_current = new_plan;
+                        // Persist revision and emit agent message
+                        if let Some(client) = db_client.as_mut() {
+                            rev_no += 1;
+                            let _ = client.query(
+                                "INSERT INTO plan_revisions(run_id, rev_no, plan_json) VALUES($1,$2,$3)",
+                                &[&run_id, &rev_no, &json!(plan_current)]
+                            ).await;
+                            // Also update the latest plan row json for convenience
+                            let _ = client.query(
+                                "UPDATE plans SET json = $1 WHERE run_id = $2 ORDER BY id DESC LIMIT 1",
+                                &[&json!(plan_current), &run_id]
+                            ).await;
+                        }
+                        if let Some(tx) = &state.event_tx {
+                            let _ = tx.send(serde_json::to_string(&SseEvent{
+                                event: "agent_message".into(),
+                                run_id,
+                                plan_steps: None,
+                                step_idx: None,
+                                tool: None,
+                                status: Some("refined".into()),
+                                message: Some("DevAgent refined plan per QA changes".into()),
+                                chunk: None,
+                                stream: None,
+                                snippet: None,
+                                has_more: None,
+                                stdout_bytes: None,
+                                stderr_bytes: None,
+                                role: Some("Dev".into()),
+                                stage: Some("plan_refine".into()),
+                                json: Some(json!(plan_current)),
+                            }).unwrap_or_else(|_| "{\"event\":\"agent_message\"}".into()));
+                        }
+                        if let Some(client) = db_client.as_mut() {
+                            let _ = client.query(
+                                "INSERT INTO agent_messages(run_id, role, stage, content, json) VALUES($1,$2,$3,$4,$5)",
+                                &[&run_id, &"Dev", &"plan_refine", &"DevAgent refined plan", &json!(plan_current)]
+                            ).await;
+                        }
+                        // QA reviews refined plan
+                        qa = match agents.review_plan_with_context(&plan_current, &qa_mem_text).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                if let Some(tx) = &state.event_tx {
+                                    let _ = tx.send(serde_json::json!({"event":"agents_error","stage":"qa","message": e.to_string()}).to_string());
+                                }
+                                verifier.review(&plan_current)
+                            }
+                        };
+                        // Emit QA follow-up message
+                        if let Some(tx) = &state.event_tx {
+                            let _ = tx.send(serde_json::to_string(&SseEvent{
+                                event: "agent_message".into(),
+                                run_id,
+                                plan_steps: None,
+                                step_idx: None,
+                                tool: None,
+                                status: Some(qa.status.clone()),
+                                message: Some(qa.rationale.clone()),
+                                chunk: None,
+                                stream: None,
+                                snippet: None,
+                                has_more: None,
+                                stdout_bytes: None,
+                                stderr_bytes: None,
+                                role: Some("QA".into()),
+                                stage: Some("plan_review".into()),
+                                json: Some(json!(qa)),
+                            }).unwrap_or_else(|_| "{\"event\":\"agent_message\"}".into()));
+                        }
+                        if let Some(client) = db_client.as_mut() {
+                            let _ = client.query(
+                                "INSERT INTO agent_messages(run_id, role, stage, content, json) VALUES($1,$2,$3,$4,$5)",
+                                &[&run_id, &"QA", &"plan_review", &qa.rationale, &json!(qa)]
+                            ).await;
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(tx) = &state.event_tx { let _ = tx.send(serde_json::json!({"event":"agents_error","stage":"dev_refine","message": e.to_string()}).to_string()); }
+                        break;
+                    }
+                }
+            }
+            // If still NeedsChanges and attempts exhausted, emit a system notice
+            if qa.status.eq_ignore_ascii_case("NeedsChanges") && attempts >= max_attempts {
+                // SSE banner/card
+                if let Some(tx) = &state.event_tx {
+                    let _ = tx.send(serde_json::to_string(&SseEvent{
+                        event: "agent_message".into(),
+                        run_id,
+                        plan_steps: None,
+                        step_idx: None,
+                        tool: None,
+                        status: Some("exhausted".into()),
+                        message: Some(format!("Dev↔QA refinement attempts exhausted after {} attempt(s). Proceeding to manager gate with last QA verdict.", attempts)),
+                        chunk: None,
+                        stream: None,
+                        snippet: None,
+                        has_more: None,
+                        stdout_bytes: None,
+                        stderr_bytes: None,
+                        role: Some("System".into()),
+                        stage: Some("devqa_exhausted".into()),
+                        json: Some(json!({"attempts": attempts, "max_attempts": max_attempts, "qa": qa})),
+                    }).unwrap_or_else(|_| "{\"event\":\"agent_message\"}".into()));
+                }
+                if let Some(client) = db_client.as_mut() {
+                    let _ = client.query(
+                        "INSERT INTO agent_messages(run_id, role, stage, content, json) VALUES($1,$2,$3,$4,$5)",
+                        &[&run_id, &"System", &"devqa_exhausted", &format!("Attempts exhausted at {}", attempts), &json!({"attempts": attempts, "max_attempts": max_attempts})]
+                    ).await;
+                }
+            }
+            // Use refined plan going forward
+            let plan = plan_current;
+            // Manager context
+            let mgr_ctx = if let Some(client) = db_client.as_ref() { memory_query(client, "default", Some("%mgr%"), 5).await } else { Vec::new() };
+            let mgr_ctx_text = if mgr_ctx.is_empty() { String::new() } else { let mut s=String::from("Context for gate:\n"); for it in &mgr_ctx { if let Some(c)=it.get("content").and_then(|v| v.as_str()){ s.push_str("- "); s.push_str(c); s.push('\n'); } } s };
+            match agents.manager_gate_with_context(&plan, &qa, &mgr_ctx_text).await {
+                Ok(mv) => {
+                    // Emit Manager message
+                    if let Some(tx) = &state.event_tx {
+                        let _ = tx.send(serde_json::to_string(&SseEvent{
+                            event: "agent_message".into(),
+                            run_id,
+                            plan_steps: None,
+                            step_idx: None,
+                            tool: None,
+                            status: Some(mv.status.clone()),
+                            message: Some(mv.rationale.clone()),
+                            chunk: None,
+                            stream: None,
+                            snippet: None,
+                            has_more: None,
+                            stdout_bytes: None,
+                            stderr_bytes: None,
+                            role: Some("Mgr".into()),
+                            stage: Some("gate".into()),
+                            json: Some(json!(mv)),
+                        }).unwrap_or_else(|_| "{\"event\":\"agent_message\"}".into()));
+                    }
+                    if let Some(client) = db_client.as_mut() {
+                        let _ = client.query(
+                            "INSERT INTO project_memories(project_key, kind, key, content, tags) VALUES($1,$2,$3,$4,$5)",
+                            &[&"default", &"agent", &format!("run:{:?}:mgr:gate", run_id), &format!("{}: {}", mv.status, mv.rationale), &"agent,mgr,gate" ]
+                        ).await;
+                        let _ = client.query(
+                            "INSERT INTO agent_messages(run_id, role, stage, content, json) VALUES($1,$2,$3,$4,$5)",
+                            &[&run_id, &"Mgr", &"gate", &mv.rationale, &json!(mv)]
+                        ).await;
+                    }
+                    mv
+                },
                 Err(_) => qa,
             }
         } else {
             verifier.review(&plan)
         };
         if let Some(tx) = &state.event_tx {
-            let _ = tx.send(serde_json::to_string(&SseEvent{ event: "verdict".into(), run_id, plan_steps: None, step_idx: None, tool: None, status: Some(verdict.status.clone()), message: Some(verdict.rationale.clone()), chunk: None, stream: None }).unwrap_or_else(|_| "{\"event\":\"verdict\"}".into()));
+            let _ = tx.send(serde_json::to_string(&SseEvent{ event: "verdict".into(), run_id, plan_steps: None, step_idx: None, tool: None, status: Some(verdict.status.clone()), message: Some(verdict.rationale.clone()), chunk: None, stream: None, snippet: None, has_more: None, stdout_bytes: None, stderr_bytes: None, role: None, stage: None, json: None }).unwrap_or_else(|_| "{\"event\":\"verdict\"}".into()));
         }
         if let Some(client) = db_client.as_mut() {
             let _ = client.query("INSERT INTO plan_verdicts(plan_id, status, rationale, json) SELECT id, $1, $2, $3 FROM plans WHERE run_id = $4 ORDER BY id DESC LIMIT 1",
@@ -464,7 +860,7 @@ async fn chat_post(
 
         if verdict.status.eq_ignore_ascii_case("Approved") {
             if let Some(tx) = &state.event_tx {
-                let _ = tx.send(serde_json::to_string(&SseEvent{ event: "execution_started".into(), run_id, plan_steps: None, step_idx: None, tool: None, status: None, message: None, chunk: None, stream: None }).unwrap_or_else(|_| "{\"event\":\"execution_started\"}".into()));
+                let _ = tx.send(serde_json::to_string(&SseEvent{ event: "execution_started".into(), run_id, plan_steps: None, step_idx: None, tool: None, status: None, message: None, chunk: None, stream: None, snippet: None, has_more: None, stdout_bytes: None, stderr_bytes: None, role: None, stage: None, json: None }).unwrap_or_else(|_| "{\"event\":\"execution_started\"}".into()));
             }
             // create execution row
             if let Some(client) = db_client.as_mut() {
@@ -474,7 +870,7 @@ async fn chat_post(
 
             for (idx, step) in plan.steps.iter().enumerate() {
                 if let Some(tx) = &state.event_tx {
-                    let _ = tx.send(serde_json::to_string(&SseEvent{ event: "step_started".into(), run_id, plan_steps: None, step_idx: Some(idx as i32), tool: Some(step.tool_ref.clone()), status: None, message: None, chunk: None, stream: None }).unwrap_or_else(|_| "{\"event\":\"step_started\"}".into()));
+                    let _ = tx.send(serde_json::to_string(&SseEvent{ event: "step_started".into(), run_id, plan_steps: None, step_idx: Some(idx as i32), tool: Some(step.tool_ref.clone()), status: None, message: None, chunk: None, stream: None, snippet: None, has_more: None, stdout_bytes: None, stderr_bytes: None, role: None, stage: None, json: None }).unwrap_or_else(|_| "{\"event\":\"step_started\"}".into()));
                 }
                 // persist step start
                 if let Some(client) = db_client.as_mut() {
@@ -500,7 +896,7 @@ async fn chat_post(
                             while offset < bytes.len() && sent < max_chunks {
                                 let end = (offset + chunk_size).min(bytes.len());
                                 let chunk = String::from_utf8_lossy(&bytes[offset..end]).to_string();
-                                let evt = SseEvent{ event: "step_partial".into(), run_id, plan_steps: None, step_idx: Some(idx as i32), tool: Some(step.tool_ref.clone()), status: None, message: None, chunk: Some(chunk), stream: Some("stdout".into()), snippet: None, has_more: None, stdout_bytes: None, stderr_bytes: None };
+                                let evt = SseEvent{ event: "step_partial".into(), run_id, plan_steps: None, step_idx: Some(idx as i32), tool: Some(step.tool_ref.clone()), status: None, message: None, chunk: Some(chunk), stream: Some("stdout".into()), snippet: None, has_more: None, stdout_bytes: None, stderr_bytes: None, role: None, stage: None, json: None };
                                 let _ = tx.send(serde_json::to_string(&evt).unwrap_or_else(|_| "{\"event\":\"step_partial\"}".into()));
                                 offset = end;
                                 sent += 1;
@@ -510,7 +906,7 @@ async fn chat_post(
                         let stdout_full = out.to_string();
                         let stdout_bytes_f = stdout_full.as_bytes().len() as f64;
                         let stdout_bytes_u = stdout_full.as_bytes().len() as u64;
-                        let mut stdout_snip = stdout_full;
+                        let mut stdout_snip = stdout_full.clone();
                         // Cap snippet to ~16KB
                         let cap: usize = 16 * 1024;
                         let mut has_more = false;
@@ -542,10 +938,10 @@ async fn chat_post(
                             // If output exceeds snippet cap, store as artifact file
                             if has_more {
                                 if let Ok(step_id) = fetch_step_id_for(&client, run_id, idx as i32).await {
-                                    if let Ok(path) = write_artifact_file(run_id, step_id, "stdout", &stdout_full).await {
+                                    if let Ok((path, checksum, mime)) = write_artifact_file(run_id, step_id, "stdout", &stdout_full).await {
                                         let _ = client.query(
-                                            "INSERT INTO artifacts(run_id, step_id, kind, path, mime, size_bytes) VALUES($1,$2,$3,$4,$5,$6)",
-                                            &[&run_id, &step_id, &"stdout".to_string(), &path, &"text/plain".to_string(), &((stdout_bytes_u) as i64)]
+                                            "INSERT INTO artifacts(run_id, step_id, kind, path, mime, size_bytes, checksum) VALUES($1,$2,$3,$4,$5,$6,$7)",
+                                            &[&run_id, &step_id, &"stdout".to_string(), &path, &mime, &((stdout_bytes_u) as i64), &checksum]
                                         ).await;
                                     }
                                 }
@@ -566,19 +962,23 @@ async fn chat_post(
                                 has_more: Some(has_more),
                                 stdout_bytes: Some(stdout_bytes_u),
                                 stderr_bytes: None,
+                                role: None,
+                                stage: None,
+                                json: None,
                             }).unwrap_or_else(|_| "{\"event\":\"step_finished\"}".into()));
                         }
                     }
                     Err(e) => {
                         combined.push_str(&format!("<div>step {} {} failed: {}</div>", idx, htmlescape::encode_minimal(&step.tool_ref), htmlescape::encode_minimal(&e.to_string())));
+                        // Precompute error details for DB and SSE
+                        let err_txt = e.to_string();
+                        let err_bytes_f = err_txt.as_bytes().len() as f64;
+                        let err_bytes_u = err_txt.as_bytes().len() as u64;
+                        let mut err_snip = err_txt.clone();
+                        let cap: usize = 8 * 1024; // smaller cap for stderr snippet
+                        let mut has_more = false;
+                        if err_snip.len() > cap { err_snip.truncate(cap); has_more = true; }
                         if let Some(client) = db_client.as_mut() {
-                            let err_txt = e.to_string();
-                            let err_bytes_f = err_txt.as_bytes().len() as f64;
-                            let err_bytes_u = err_txt.as_bytes().len() as u64;
-                            let mut err_snip = err_txt.clone();
-                            let cap: usize = 8 * 1024; // smaller cap for stderr snippet
-                            let mut has_more = false;
-                            if err_snip.len() > cap { err_snip.truncate(cap); has_more = true; }
                             let _ = client.query(
                                 "UPDATE steps SET output_json=$1, stderr_snip=$2, status='error', finished_at=now() WHERE execution_id = (SELECT id FROM executions WHERE plan_id=(SELECT id FROM plans WHERE run_id=$3 ORDER BY id DESC LIMIT 1) ORDER BY id DESC LIMIT 1) AND idx=$4",
                                 &[&json!({"error": err_txt}), &err_snip, &run_id, &(idx as i32)]
@@ -603,10 +1003,10 @@ async fn chat_post(
                             // If error output exceeds snippet cap, store as artifact file
                             if has_more {
                                 if let Ok(step_id) = fetch_step_id_for(&client, run_id, idx as i32).await {
-                                    if let Ok(path) = write_artifact_file(run_id, step_id, "stderr", &err_txt).await {
+                                    if let Ok((path, checksum, mime)) = write_artifact_file(run_id, step_id, "stderr", &err_txt).await {
                                         let _ = client.query(
-                                            "INSERT INTO artifacts(run_id, step_id, kind, path, mime, size_bytes) VALUES($1,$2,$3,$4,$5,$6)",
-                                            &[&run_id, &step_id, &"stderr".to_string(), &path, &"text/plain".to_string(), &((err_bytes_u) as i64)]
+                                            "INSERT INTO artifacts(run_id, step_id, kind, path, mime, size_bytes, checksum) VALUES($1,$2,$3,$4,$5,$6,$7)",
+                                            &[&run_id, &step_id, &"stderr".to_string(), &path, &mime, &((err_bytes_u) as i64), &checksum]
                                         ).await;
                                     }
                                 }
@@ -620,13 +1020,16 @@ async fn chat_post(
                                 step_idx: Some(idx as i32),
                                 tool: Some(step.tool_ref.clone()),
                                 status: Some("error".into()),
-                                message: Some(e.to_string()),
+                                message: Some(err_txt.clone()),
                                 chunk: None,
                                 stream: None,
-                                snippet: Some(err_snip),
+                                snippet: Some(err_snip.clone()),
                                 has_more: Some(has_more),
                                 stdout_bytes: None,
                                 stderr_bytes: Some(err_bytes_u),
+                                role: None,
+                                stage: None,
+                                json: None,
                             }).unwrap_or_else(|_| "{\"event\":\"step_finished\"}".into()));
                         }
                     }
@@ -659,7 +1062,7 @@ async fn chat_post(
                 }
             }
             if let Some(tx) = &state.event_tx {
-                let _ = tx.send(serde_json::to_string(&SseEvent{ event: "run_finished".into(), run_id, plan_steps: None, step_idx: None, tool: None, status: Some("done".into()), message: None, chunk: None, stream: None }).unwrap_or_else(|_| "{\"event\":\"run_finished\"}".into()));
+                let _ = tx.send(serde_json::to_string(&SseEvent{ event: "run_finished".into(), run_id, plan_steps: None, step_idx: None, tool: None, status: Some("done".into()), message: None, chunk: None, stream: None, snippet: None, has_more: None, stdout_bytes: None, stderr_bytes: None, role: None, stage: None, json: None }).unwrap_or_else(|_| "{\"event\":\"run_finished\"}".into()));
             }
         } else {
             if let Some(client) = db_client.as_mut() { let _ = client.query("UPDATE runs SET status='blocked' WHERE id=$1", &[&run_id]).await; }
@@ -809,7 +1212,38 @@ struct MetricRow {
     created_at: Option<String>,
 }
 
-async fn metrics_get(State(state): State<Arc<WebState>>, axum::extract::Path(id): axum::extract::Path<i64>) -> impl IntoResponse {
+// --- One-time optional table bootstrap (best-effort, idempotent) ---
+async fn ensure_optional_tables(client: &pg::Client) -> Result<(), String> {
+    // agent_messages
+    let _ = client.query(
+        "CREATE TABLE IF NOT EXISTS agent_messages (\n            id BIGSERIAL PRIMARY KEY,\n            run_id BIGINT,\n            role TEXT,\n            stage TEXT,\n            content TEXT,\n            json JSONB,\n            created_at TIMESTAMPTZ DEFAULT now()\n        )",
+        &[]
+    ).await.map_err(|e| e.to_string());
+    let _ = client.query(
+        "CREATE INDEX IF NOT EXISTS idx_agent_messages_run ON agent_messages(run_id, created_at)",
+        &[]
+    ).await.map_err(|e| e.to_string());
+
+    // plan_revisions
+    let _ = client.query(
+        "CREATE TABLE IF NOT EXISTS plan_revisions (\n            id BIGSERIAL PRIMARY KEY,\n            run_id BIGINT,\n            rev_no INT,\n            plan_json JSONB,\n            created_at TIMESTAMPTZ DEFAULT now()\n        )",
+        &[]
+    ).await.map_err(|e| e.to_string());
+    let _ = client.query(
+        "CREATE INDEX IF NOT EXISTS idx_plan_revisions_run ON plan_revisions(run_id, rev_no)",
+        &[]
+    ).await.map_err(|e| e.to_string());
+
+    // artifacts table optional columns (noop if table doesn't exist)
+    let _ = client.query(
+        "ALTER TABLE IF EXISTS artifacts ADD COLUMN IF NOT EXISTS checksum TEXT",
+        &[]
+    ).await.map_err(|e| e.to_string());
+
+    Ok(())
+}
+
+async fn metrics_get(State(state): State<Arc<WebState>>, AxPath(id): AxPath<i64>) -> impl IntoResponse {
     if let Some(dsn) = &state.db_dsn {
         // best-effort connect and fetch
         match pg::connect(dsn, pg::NoTls).await {

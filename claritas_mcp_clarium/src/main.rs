@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use tokio::{io::{AsyncBufReadExt, AsyncWriteExt, BufReader}, select};
 use tracing::{error, info};
 use tokio_postgres as pg;
+use tokio_postgres::types::ToSql;
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -38,7 +39,9 @@ async fn main() -> anyhow::Result<()> {
             json!({
                 "tools": [
                     "clarium.generate_sql","clarium.validate_sql","clarium.parse","clarium.execute",
+                    "clarium.execute.extended",
                     "db.schema.inspect","db.schema.diff","db.index.suggest","db.query.explain",
+                    "db.query.explain.extended",
                     "meta.ping","meta.capabilities"
                 ]
             })
@@ -142,6 +145,23 @@ async fn handle_line(
                 json!({"ok": false, "error": "missing DSN for clarium.execute"})
             }
         }
+        "clarium.execute.extended" => {
+            // Extended execute with positional parameters: { sql, params: [], limit? }
+            let sql = params.get("sql").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as i64;
+            let param_values: Vec<Value> = params.get("params").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            if let Some(ref dsn_s) = dsn {
+                match execute_with_postgres_ext(dsn_s, sql, &param_values, limit).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if let Some(db) = e.downcast_ref::<pg::Error>() { json!({"ok": false, "error": db_error_json(db)}) }
+                        else { json!({"ok": false, "error": {"message": e.to_string()}}) }
+                    }
+                }
+            } else {
+                json!({"ok": false, "error": "missing DSN for clarium.execute.extended"})
+            }
+        }
         "db.query.explain" => {
             // Params: { sql: string, analyze?: bool }
             let sql = params.get("sql").and_then(|v| v.as_str()).unwrap_or("");
@@ -159,6 +179,23 @@ async fn handle_line(
                 }
             } else {
                 json!({"ok": false, "error": "missing DSN for db.query.explain"})
+            }
+        }
+        "db.query.explain.extended" => {
+            // Params: { sql: string, params: [], analyze?: bool }
+            let sql = params.get("sql").and_then(|v| v.as_str()).unwrap_or("");
+            let analyze = params.get("analyze").and_then(|v| v.as_bool()).unwrap_or(false);
+            let param_values: Vec<Value> = params.get("params").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            if let Some(ref dsn_s) = dsn {
+                match explain_with_postgres_ext(dsn_s, sql, &param_values, analyze).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if let Some(db) = e.downcast_ref::<pg::Error>() { json!({"ok": false, "error": db_error_json(db)}) }
+                        else { json!({"ok": false, "error": {"message": e.to_string()}}) }
+                    }
+                }
+            } else {
+                json!({"ok": false, "error": "missing DSN for db.query.explain.extended"})
             }
         }
         "db.schema.inspect" => {
@@ -227,13 +264,39 @@ async fn handle_line(
 
 // --- Postgres helpers (placeholder/simple) ---
 
+/// Very naive normalization: replace Clarium-style named bind variables (e.g., :user_id)
+/// with NULL so Postgres can parse the statement without requiring parameter types/values.
+/// This is intended only for validate/parse flows, not for execution.
+fn normalize_named_binds(sql: &str) -> String {
+    // Match occurrences like :name (where name starts with a letter/underscore and continues with word chars)
+    // Avoid replacing '::' casts by requiring a word boundary or whitespace before ':' when possible.
+    // Simpler approach: replace ":identifier" not preceded by ':' (to avoid '::type').
+    let re = regex::Regex::new(r"(?s)(?P<prefix>[^:]|^):(?P<name>[a-zA-Z_][a-zA-Z0-9_]*)").unwrap();
+    let mut out = String::with_capacity(sql.len());
+    let mut last = 0usize;
+    for cap in re.captures_iter(sql) {
+        let m = cap.get(0).unwrap();
+        // prefix is the char before ':' (or start anchor)
+        let prefix = cap.name("prefix").unwrap().as_str();
+        out.push_str(&sql[last..m.start()]);
+        out.push_str(prefix);
+        // Replace the entire ":name" with NULL
+        out.push_str("NULL");
+        last = m.end();
+    }
+    out.push_str(&sql[last..]);
+    out
+}
+
 async fn validate_with_postgres(dsn: &str, sql: &str) -> anyhow::Result<Value> {
-    // Use PREPARE to validate syntax and types without executing
+    // Use PREPARE to validate syntax and types without executing.
+    // For validate, we normalize named binds to NULL to allow parsing without parameter metadata.
+    let sql_norm = normalize_named_binds(sql);
     let (client, conn) = pg::connect(dsn, pg::NoTls).await?;
     tokio::spawn(async move {
         let _ = conn.await;
     });
-    let stmt_text = format!("PREPARE claritasai_tmp AS {}", sql);
+    let stmt_text = format!("PREPARE claritasai_tmp AS {}", sql_norm);
     let res = client.batch_execute(&stmt_text).await;
     // Try to DEALLOCATE even if prepare failed
     let _ = client.batch_execute("DEALLOCATE ALL").await;
@@ -252,8 +315,9 @@ async fn validate_with_postgres(dsn: &str, sql: &str) -> anyhow::Result<Value> {
 async fn explain_with_postgres(dsn: &str, sql: &str, analyze: bool) -> anyhow::Result<Value> {
     let (client, conn) = pg::connect(dsn, pg::NoTls).await?;
     tokio::spawn(async move { let _ = conn.await; });
+    // Normalize named binds to NULL for parse/explain.
     let prefix = if analyze { "EXPLAIN (ANALYZE, VERBOSE, COSTS) " } else { "EXPLAIN (VERBOSE, COSTS) " };
-    let q = format!("{}{}", prefix, sql);
+    let q = format!("{}{}", prefix, normalize_named_binds(sql));
     let rows = client.query(q.as_str(), &[]).await?;
     let mut plan_lines: Vec<String> = Vec::new();
     for r in rows { let txt: &str = r.get(0); plan_lines.push(txt.to_string()); }
@@ -270,6 +334,101 @@ async fn explain_with_postgres(dsn: &str, sql: &str, analyze: bool) -> anyhow::R
             }
         }
         let total_runtime_ms = execution_ms; // Postgres reports Execution Time as total runtime
+        Ok(json!({"ok": true, "plan": plan_lines, "planning_ms": planning_ms, "execution_ms": execution_ms, "total_runtime_ms": total_runtime_ms}))
+    } else {
+        Ok(json!({"ok": true, "plan": plan_lines}))
+    }
+}
+
+/// Convert JSON params into Postgres ToSql arguments.
+fn build_param_refs(params: &[Value]) -> (Vec<Box<dyn ToSql + Sync>>, Vec<&(dyn ToSql + Sync)>) {
+    let mut boxed: Vec<Box<dyn ToSql + Sync>> = Vec::with_capacity(params.len());
+    for v in params {
+        match v {
+            Value::Null => {
+                // Use Option::<String>::None to represent NULL
+                let none: Option<String> = None;
+                boxed.push(Box::new(none));
+            }
+            Value::Bool(b) => boxed.push(Box::new(*b)),
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() { boxed.push(Box::new(i)); }
+                else if let Some(u) = n.as_u64() { boxed.push(Box::new(u as i64)); }
+                else if let Some(f) = n.as_f64() { boxed.push(Box::new(f)); }
+                else { boxed.push(Box::new(n.to_string())); }
+            }
+            Value::String(s) => boxed.push(Box::new(s.clone())),
+            other @ Value::Array(_) | other @ Value::Object(_) => {
+                // Pass through as JSON (requires with-serde_json feature)
+                boxed.push(Box::new(other.clone()));
+            }
+        }
+    }
+    let ptrs: Vec<&(dyn ToSql + Sync)> = boxed.iter().map(|b| &**b as &(dyn ToSql + Sync)).collect();
+    (boxed, ptrs)
+}
+
+async fn execute_with_postgres_ext(dsn: &str, sql: &str, params: &[Value], limit: i64) -> anyhow::Result<Value> {
+    use tokio::time::Instant;
+    let start = Instant::now();
+    let (client, conn) = pg::connect(dsn, pg::NoTls).await?;
+    tokio::spawn(async move { let _ = conn.await; });
+    let trimmed = sql.trim().to_ascii_lowercase();
+    let (owned, refs) = build_param_refs(params);
+    if trimmed.starts_with("select") {
+        let q = format!("WITH _q AS ({}) SELECT * FROM _q LIMIT {}", sql, limit);
+        let rows = client.query(q.as_str(), &refs).await?;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let mut out_rows: Vec<Vec<String>> = Vec::new();
+        for row in rows {
+            let mut cols: Vec<String> = Vec::new();
+            for i in 0..row.len() {
+                let v: Result<String, _> = row.try_get(i);
+                cols.push(v.unwrap_or_else(|_| "<unrepr>".into()));
+            }
+            out_rows.push(cols);
+        }
+        // keep owned alive
+        std::mem::drop(owned);
+        Ok(json!({"ok": true, "rows": out_rows, "elapsed_ms": elapsed_ms}))
+    } else {
+        let res = client.execute(sql, &refs).await;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        std::mem::drop(owned);
+        match res {
+            Ok(affected) => Ok(json!({"ok": true, "rows_affected": affected as i64, "elapsed_ms": elapsed_ms})),
+            Err(e) => {
+                if let Some(db) = e.as_db_error() {
+                    Ok(json!({"ok": false, "error": db_error_json_from_db(db)}))
+                } else {
+                    Ok(json!({"ok": false, "error": {"message": e.to_string()}}))
+                }
+            }
+        }
+    }
+}
+
+async fn explain_with_postgres_ext(dsn: &str, sql: &str, params: &[Value], analyze: bool) -> anyhow::Result<Value> {
+    let (client, conn) = pg::connect(dsn, pg::NoTls).await?;
+    tokio::spawn(async move { let _ = conn.await; });
+    let prefix = if analyze { "EXPLAIN (ANALYZE, VERBOSE, COSTS) " } else { "EXPLAIN (VERBOSE, COSTS) " };
+    let q = format!("{}{}", prefix, sql);
+    let (_owned, refs) = build_param_refs(params);
+    let rows = client.query(q.as_str(), &refs).await?;
+    let mut plan_lines: Vec<String> = Vec::new();
+    for r in rows { let txt: &str = r.get(0); plan_lines.push(txt.to_string()); }
+    if analyze {
+        let mut planning_ms: Option<f64> = None;
+        let mut execution_ms: Option<f64> = None;
+        for l in &plan_lines {
+            let s = l.trim();
+            if s.starts_with("Planning Time:") {
+                if let Some(val) = s.split(':').nth(1) { planning_ms = extract_ms(val); }
+            } else if s.starts_with("Execution Time:") {
+                if let Some(val) = s.split(':').nth(1) { execution_ms = extract_ms(val); }
+            }
+        }
+        let total_runtime_ms = execution_ms;
         Ok(json!({"ok": true, "plan": plan_lines, "planning_ms": planning_ms, "execution_ms": execution_ms, "total_runtime_ms": total_runtime_ms}))
     } else {
         Ok(json!({"ok": true, "plan": plan_lines}))

@@ -105,8 +105,16 @@ async fn main() -> Result<()> {
             if storage.backend.eq_ignore_ascii_case("clarium") {
                 if let Some(cl) = &storage.clarium {
                     if let Some(dsn) = &cl.dsn {
-                        if let Err(e) = ensure_db_and_migrate(dsn).await {
-                            error!(error=%e, "database bootstrap failed");
+                        // Validate DSN early to produce clearer diagnostics than a generic "invalid configuration"
+                        match validate_dsn(dsn) {
+                            Ok(_) => {
+                                if let Err(e) = ensure_db_and_migrate(dsn).await {
+                                    error!(error=%e, "database bootstrap failed");
+                                }
+                            }
+                            Err(e) => {
+                                error!(error = %e, dsn=?mask_dsn(dsn), "invalid database configuration (DSN)");
+                            }
                         }
                     }
                 }
@@ -153,6 +161,8 @@ struct AppConfig {
     notify: Option<NotifyConfig>,
     #[allow(dead_code)]
     agents: Option<AgentsConfig>,
+    #[allow(dead_code)]
+    executor: Option<ExecutorConfig>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -190,6 +200,9 @@ struct AgentsConfig {
     enabled: bool,
     #[serde(default)]
     ollama: Option<OllamaConfig>,
+    /// Max Dev↔QA refinement attempts
+    #[serde(default)]
+    max_attempts: Option<usize>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -228,6 +241,16 @@ struct NotifyWhatsAppBlock {
     #[serde(default)] api_url: String,
     #[serde(default)] token: String,
     #[serde(default)] to: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ExecutorConfig {
+    #[serde(default)]
+    partial_chunk_size: Option<usize>,
+    #[serde(default)]
+    partial_max_chunks: Option<usize>,
+    #[serde(default)]
+    step_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -290,6 +313,9 @@ struct McpServer {
 
 fn build_web_state_from_config(cfg: Option<&AppConfig>) -> WebState {
     let mut state = WebState::default();
+    // Set sane defaults for streaming
+    state.partial_chunk_size = 1024;
+    state.partial_max_chunks = 3;
     if let Some(cfg) = cfg {
         // pick python workspace root if present
         if let Some(ws) = &cfg.workspace {
@@ -348,7 +374,7 @@ fn build_web_state_from_config(cfg: Option<&AppConfig>) -> WebState {
                     hub = hub.with_provider(NotifyProvider::WhatsApp(cfg));
                 }
             }
-            state.notifier_hub = Some(hub);
+            state.notifier_hub = Some(Arc::new(hub));
         }
 
         // Build AgentsHarness (Ollama) if enabled
@@ -359,7 +385,16 @@ fn build_web_state_from_config(cfg: Option<&AppConfig>) -> WebState {
                         state.agents = Some(AgentsHarness::new(expand_env_vars(&ol.url), expand_env_vars(&ol.model)));
                     }
                 }
+                // Apply max attempts if provided
+                if let Some(maxa) = ag.max_attempts { state.agents_max_attempts = Some(maxa); }
             }
+        }
+
+        // Executor streaming/timeouts
+        if let Some(exec) = &cfg.executor {
+            if let Some(sz) = exec.partial_chunk_size { state.partial_chunk_size = sz.max(128); }
+            if let Some(mc) = exec.partial_max_chunks { state.partial_max_chunks = mc.max(1); }
+            state.step_timeout_ms = exec.step_timeout_ms;
         }
     }
     state
@@ -555,7 +590,44 @@ fn build_tool_registry_from_config(cfg: Option<&AppConfig>) -> ToolRegistry {
 
 // ---------------- Storage (Postgres) ----------------
 
+/// Very small DSN validator to provide clearer errors before attempting a connection.
+fn validate_dsn(dsn: &str) -> anyhow::Result<()> {
+    let url = Url::parse(dsn)?;
+    let scheme = url.scheme();
+    if scheme != "postgres" && scheme != "postgresql" {
+        anyhow::bail!("unsupported scheme '{}', expected 'postgres' or 'postgresql'", scheme);
+    }
+    // database name must be present in URL path
+    let db_name = url.path().trim_start_matches('/');
+    if db_name.is_empty() {
+        anyhow::bail!("missing database name in DSN path");
+    }
+    Ok(())
+}
+
+/// Mask credentials in DSN for logs.
+fn mask_dsn(dsn: &str) -> String {
+    if let Ok(url) = Url::parse(dsn) {
+        let mut masked = url.clone();
+        if masked.username().len() > 0 || masked.password().is_some() {
+            // Replace userinfo with ****
+            let host = masked.host_str().unwrap_or("").to_string();
+            let port = masked.port().map(|p| format!(":{}", p)).unwrap_or_default();
+            let path = masked.path().to_string();
+            let mut out = format!("{}://****:****@{}{}{}", masked.scheme(), host, port, path);
+            if let Some(q) = masked.query() { out.push_str(&format!("?{}", q)); }
+            return out;
+        }
+        return dsn.to_string();
+    }
+    dsn.to_string()
+}
+
 async fn ensure_db_and_migrate(target_dsn: &str) -> anyhow::Result<()> {
+    // First, parse and validate the DSN to produce actionable errors early.
+    let url = Url::parse(target_dsn)?;
+    let db_name = url.path().trim_start_matches('/').to_string();
+
     // Try to connect to the target DB directly
     if let Ok((_client, conn)) = pg::connect(target_dsn, pg::NoTls).await {
         // spawn connection driver
@@ -568,9 +640,7 @@ async fn ensure_db_and_migrate(target_dsn: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Parse DSN to extract db name and construct admin DSN pointing to 'postgres'
-    let url = Url::parse(target_dsn)?;
-    let db_name = url.path().trim_start_matches('/').to_string();
+    // Construct admin DSN pointing to 'postgres'
     let mut admin_url = url.clone();
     admin_url.set_path("/postgres");
 

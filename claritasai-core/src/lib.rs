@@ -22,6 +22,8 @@ pub struct PlanStep {
 pub struct PlanVerdict {
     pub status: String, // "Approved" | "NeedsChanges" | "Rejected"
     pub rationale: String,
+    #[serde(skip_serializing_if = "Option::is_none")] pub required_changes: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub notes: Option<String>,
 }
 
 #[derive(Debug, Default)]

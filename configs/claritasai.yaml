@@ -6,7 +6,7 @@ server:
 storage:
   backend: clarium
   clarium:
-    dsn: "postgres://localhost:5433/claritas"
+    dsn: "postgres://clarium:clarium@127.0.0.1:5433/claritas"
 
 workspace:
   python:
@@ -37,7 +37,7 @@ mcp:
     - id: clarium
       endpoint: auto
       command: claritas_mcp_clarium
-      args: ["--dsn","postgres://localhost:5433/claritas","--spec","${CLARIUM_SPEC_ROOT}"]
+      args: ["--dsn","postgres://clarium:clarium@127.0.0.1:5433/claritas","--spec","${CLARIUM_SPEC_ROOT}"]
 
 notifications:
   telegram:
@@ -65,6 +65,11 @@ notifications:
     to: "+0987654321"
 
 agents:
+  enabled: true
+  max_attempts: 2
+  ollama:
+    url: http://127.0.0.1:11434
+    model: gemma3:4b
   planner:
     model: mcp:openai:gpt-4o
     tools: ["python.*", "rust.*", "clarium.*", "code.*", "fs.*", "db.*"]
@@ -74,5 +79,10 @@ agents:
   executor:
     model: none
     tools: ["python.*", "rust.*", "clarium.*", "fs.*", "deploy.*"]
+
+executor:
+  partial_chunk_size: 1024
+  partial_max_chunks: 3
+  step_timeout_ms: 60000
 
 experiments: []
