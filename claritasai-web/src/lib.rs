@@ -20,8 +20,8 @@ use tokio_stream::StreamExt;
 use tokio::time::Instant;
 use tokio_stream::wrappers::BroadcastStream;
 use claritasai_notify::{NotifierHub, NotifyMessage};
-use claritasai_core::{Workspace, Project, MemoryGuidelines, Plan};
-use claritasai_runtime::{Orchestrator, OrchestratorConfig, Approval, ApprovalStatus, Role};
+use claritasai_core::{Workspace, Project, MemoryGuidelines, Plan, Patch, PatchFormat, SafeFs};
+use claritasai_runtime::{Orchestrator, OrchestratorConfig, Approval, ApprovalStatus, Role, PatchPipeline};
 use serde::{Serialize, Deserialize};
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
@@ -89,6 +89,10 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/runs/:id/artifacts", get(run_artifacts_get))
         .route("/artifacts/:id", get(artifact_download))
         .route("/memories", get(memories_list))
+        .route("/memories/write", axum::routing::post(memories_write))
+        // Self‑development API
+        .route("/patch/validate", axum::routing::post(patch_validate))
+        .route("/patch/apply", axum::routing::post(patch_apply))
         // Approvals and run control
         .route("/runs/:id/approve", axum::routing::post(run_approve))
         .route("/runs/:id/reject", axum::routing::post(run_reject))
@@ -100,7 +104,249 @@ pub fn router(state: Arc<WebState>) -> Router {
         .with_state(state)
 }
 
-async fn health() -> &'static str { "OK" }
+// -------- Self‑development API types/helpers --------
+#[derive(Debug, Clone, Deserialize)]
+struct PatchReq {
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    diffs: Vec<String>,
+    #[serde(default = "default_unified")] 
+    format: String, // "UnifiedDiff" | "Structured"
+    // Optional roots
+    #[serde(default)] rust_root: Option<String>,
+    #[serde(default)] python_root: Option<String>,
+    // Optional FS root
+    #[serde(default)] fs_root: Option<String>,
+    // Optional run context for artifact persistence
+    #[serde(default)] run_id: Option<i64>,
+    #[serde(default)] step_idx: Option<i32>,
+}
+
+fn default_unified() -> String { "UnifiedDiff".into() }
+
+fn to_patch(req: &PatchReq) -> Patch {
+    let fmt = match req.format.as_str() { "Structured" => PatchFormat::Structured, _ => PatchFormat::UnifiedDiff };
+    Patch { format: fmt, description: req.description.clone(), diffs: req.diffs.clone() }
+}
+
+async fn patch_validate(State(state): State<Arc<WebState>>, Json(req): Json<PatchReq>) -> impl IntoResponse {
+    let reg = match &state.tool_registry { Some(r) => r.clone(), None => return (StatusCode::BAD_REQUEST, Json(json!({"ok": false, "message": "ToolRegistry not available"}))).into_response(), };
+    let reg = Arc::new(reg);
+    let patch = to_patch(&req);
+    let rust_root = req.rust_root.clone().or_else(|| state.rust_root.clone()).unwrap_or_else(|| ".".into());
+    let python_root = req.python_root.clone().or_else(|| state.python_root.clone()).unwrap_or_else(|| ".".into());
+
+    let pipeline = PatchPipeline::new(reg)
+        .with_rust_root(rust_root.clone())
+        .with_python_root(python_root.clone())
+        .with_event_tx(state.event_tx.clone());
+
+    match pipeline.validate(&patch).await {
+        Ok(report) => {
+            let gates: Vec<serde_json::Value> = report.gate_events.iter().map(|g| json!({
+                "gate": g.gate, "root": g.root, "ok": g.ok, "duration_ms": g.duration_ms, "message": g.message
+            })).collect();
+            let response_json = json!({
+                "ok": report.ok,
+                "checks": report.checks,
+                "details": report.details,
+                "duration_ms": report.duration_ms,
+                "gates": gates,
+                "rust_root": rust_root,
+                "python_root": python_root,
+            });
+            // Persist artifacts/memory if run context provided
+            if let (Some(dsn), Some(rid)) = (&state.db_dsn, req.run_id) {
+                if let Ok((client, conn)) = pg::connect(dsn, pg::NoTls).await {
+                    tokio::spawn(async move { let _ = conn.await; });
+                    let _ = ensure_artifacts_tables(&client).await;
+                    if let Some(step_idx) = req.step_idx {
+                        if let Ok(step_id) = fetch_step_id_for(&client, Some(rid), step_idx).await {
+                            let content = serde_json::to_string_pretty(&response_json).unwrap_or_else(|_| "{}".into());
+                            if let Ok((path, checksum, mime)) = write_artifact_file(Some(rid), step_id, "validation_report", &content).await {
+                                let _ = insert_artifact_row(&client, rid, step_id, "validation_report", Some(path), Some(mime), Some(checksum), Some(content.len() as i64)).await;
+                            }
+                            for (idx, g) in report.gate_events.iter().enumerate() {
+                                let mut log = String::new();
+                                log.push_str(&format!("gate: {}\nroot: {}\nstatus: {}\nduration_ms: {}\n", g.gate, g.root, if g.ok {"ok"} else {"failed"}, g.duration_ms));
+                                if let Some(m) = &g.message { log.push_str(&format!("message: {}\n", m)); }
+                                let kind = format!("gate_{}_{}", idx, if g.ok {"ok"} else {"fail"});
+                                if let Ok((path, checksum, mime)) = write_artifact_file(Some(rid), step_id, &kind, &log).await {
+                                    let _ = insert_artifact_row(&client, rid, step_id, &kind, Some(path), Some(mime), Some(checksum), Some(log.len() as i64)).await;
+                                }
+                            }
+                            // memory summary
+                            let project_key = state.rust_root.clone().or_else(|| state.python_root.clone()).unwrap_or_else(|| "default".to_string());
+                            let mem_content = format!("validation {} ({} gates, ok={})", req.description, report.gate_events.len(), report.ok);
+                            let mem_tags = if report.ok { "patch_check,ok" } else { "patch_check,failed" };
+                            memory_write(&client, &project_key, "patch_check", &format!("run:{}:step:{}:validate", rid, step_idx), &mem_content, mem_tags).await;
+                        }
+                    }
+                }
+            }
+            Json(response_json).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn patch_apply(State(state): State<Arc<WebState>>, Json(req): Json<PatchReq>) -> impl IntoResponse {
+    let reg = match &state.tool_registry { Some(r) => r.clone(), None => return (StatusCode::BAD_REQUEST, Json(json!({"ok": false, "message": "ToolRegistry not available"}))).into_response(), };
+    let reg = Arc::new(reg);
+    let patch = to_patch(&req);
+    let rust_root = req.rust_root.clone().or_else(|| state.rust_root.clone()).unwrap_or_else(|| ".".into());
+    let python_root = req.python_root.clone().or_else(|| state.python_root.clone()).unwrap_or_else(|| ".".into());
+    let fs_root = req.fs_root.clone().or_else(|| state.rust_root.clone()).unwrap_or_else(|| ".".into());
+
+    let pipeline = PatchPipeline::new(reg)
+        .with_rust_root(rust_root)
+        .with_python_root(python_root)
+        .with_event_tx(state.event_tx.clone());
+
+    let fs = SafeFs::new(fs_root.clone());
+    match pipeline.apply_with_rollback(&patch, &fs).await {
+        Ok(report) => {
+            let gates: Vec<serde_json::Value> = report.gate_events.iter().map(|g| json!({
+                "gate": g.gate, "root": g.root, "ok": g.ok, "duration_ms": g.duration_ms, "message": g.message
+            })).collect();
+            let response_json = json!({
+                "ok": report.applied,
+                "applied": report.applied,
+                "outcome": {"files_changed": report.outcome.files_changed, "checks": report.outcome.checks},
+                "details": report.details,
+                "duration_ms": report.duration_ms,
+                "summary": report.summary_json,
+                "gates": gates,
+                "fs_root": fs_root,
+            });
+            if let (Some(dsn), Some(rid)) = (&state.db_dsn, req.run_id) {
+                if let Ok((client, conn)) = pg::connect(dsn, pg::NoTls).await {
+                    tokio::spawn(async move { let _ = conn.await; });
+                    let _ = ensure_artifacts_tables(&client).await;
+                    if let Some(step_idx) = req.step_idx {
+                        if let Ok(step_id) = fetch_step_id_for(&client, Some(rid), step_idx).await {
+                            let content = serde_json::to_string_pretty(&response_json).unwrap_or_else(|_| "{}".into());
+                            let kind = if report.applied { "apply_report" } else { "apply_failed" };
+                            if let Ok((path, checksum, mime)) = write_artifact_file(Some(rid), step_id, kind, &content).await {
+                                let _ = insert_artifact_row(&client, rid, step_id, kind, Some(path), Some(mime), Some(checksum), Some(content.len() as i64)).await;
+                            }
+                            for (idx, g) in report.gate_events.iter().enumerate() {
+                                let mut log = String::new();
+                                log.push_str(&format!("gate: {}\nroot: {}\nstatus: {}\nduration_ms: {}\n", g.gate, g.root, if g.ok {"ok"} else {"failed"}, g.duration_ms));
+                                if let Some(m) = &g.message { log.push_str(&format!("message: {}\n", m)); }
+                                let kind = format!("gate_{}_{}", idx, if g.ok {"ok"} else {"fail"});
+                                if let Ok((path, checksum, mime)) = write_artifact_file(Some(rid), step_id, &kind, &log).await {
+                                    let _ = insert_artifact_row(&client, rid, step_id, &kind, Some(path), Some(mime), Some(checksum), Some(log.len() as i64)).await;
+                                }
+                            }
+                            let project_key = state.rust_root.clone().or_else(|| state.python_root.clone()).unwrap_or_else(|| "default".to_string());
+                            let mem_content = format!("apply {} (gates={}, applied={})", req.description, report.gate_events.len(), report.applied);
+                            let mem_tags = if report.applied { "patch_apply,ok" } else { "patch_apply,failed" };
+                            memory_write(&client, &project_key, "patch_apply", &format!("run:{}:step:{}:apply", rid, step_idx), &mem_content, mem_tags).await;
+                        }
+                    }
+                }
+            }
+            Json(response_json).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "error": e.to_string()}))).into_response(),
+    }
+}
+
+// --- DB helpers for artifacts (MVP) ---
+async fn ensure_artifacts_tables(client: &pg::Client) -> Result<(), String> {
+    let q1 = r#"
+        CREATE TABLE IF NOT EXISTS artifacts (
+            id BIGSERIAL PRIMARY KEY,
+            run_id BIGINT NOT NULL,
+            step_id BIGINT NOT NULL,
+            kind TEXT NOT NULL,
+            path TEXT,
+            mime TEXT,
+            size_bytes BIGINT,
+            checksum TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    "#;
+    let q2 = r#"
+        CREATE TABLE IF NOT EXISTS step_attachments (
+            id BIGSERIAL PRIMARY KEY,
+            step_id BIGINT NOT NULL,
+            kind TEXT NOT NULL,
+            path TEXT,
+            mime TEXT,
+            size_bytes BIGINT,
+            checksum TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    "#;
+    client.batch_execute(q1).await.map_err(|e| e.to_string())?;
+    client.batch_execute(q2).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn insert_artifact_row(
+    client: &pg::Client,
+    run_id: i64,
+    step_id: i64,
+    kind: &str,
+    path: Option<String>,
+    mime: Option<String>,
+    checksum: Option<String>,
+    size_bytes: Option<i64>,
+) -> Result<i64, String> {
+    let row = client
+        .query_one(
+            "INSERT INTO artifacts(run_id, step_id, kind, path, mime, size_bytes, checksum) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id",
+            &[&run_id, &step_id, &kind, &path, &mime, &size_bytes, &checksum],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(row.get::<usize, i64>(0))
+}
+
+// duplicate removed (see definitions later in file)
+
+// --- Memory write endpoint (MVP) ---
+#[derive(Debug, serde::Deserialize)]
+struct MemoryWriteBody { project: String, kind: String, key: String, content: String, #[serde(default)] tags: String }
+
+async fn memories_write(State(state): State<Arc<WebState>>, Json(body): Json<MemoryWriteBody>) -> impl IntoResponse {
+    if let Some(dsn) = &state.db_dsn {
+        if let Ok((client, conn)) = pg::connect(dsn, pg::NoTls).await {
+            tokio::spawn(async move { let _ = conn.await; });
+            memory_write(&client, &body.project, &body.kind, &body.key, &body.content, &body.tags).await;
+            return Json(json!({"ok": true})).into_response();
+        }
+    }
+    (StatusCode::BAD_REQUEST, Json(json!({"ok": false, "message": "DB not configured"}))).into_response()
+}
+
+async fn health(State(state): State<Arc<WebState>>) -> impl IntoResponse {
+    // Base response
+    let mut obj = serde_json::Map::new();
+    obj.insert("ok".to_string(), serde_json::Value::Bool(true));
+
+    // Include MCP status (ok + capabilities) if registry available
+    if let Some(reg) = &state.tool_registry {
+        let statuses = reg.status_all(3).await; // 3s timeout per host
+        let mut m = serde_json::Map::new();
+        for (sid, val) in &statuses {
+            m.insert(sid.clone(), val.clone());
+        }
+        obj.insert("mcp".to_string(), serde_json::Value::Object(m.clone()));
+        // Emit SSE health snapshot event
+        if let Some(tx) = &state.event_tx {
+            let _ = tx.send(json!({
+                "event": "mcp_health",
+                "status": m,
+            }).to_string());
+        }
+    }
+
+    Json(serde_json::Value::Object(obj))
+}
 
 // Simple DB connectivity self-check endpoint
 async fn db_check(State(state): State<Arc<WebState>>) -> impl IntoResponse {

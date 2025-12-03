@@ -36,5 +36,5 @@ pub struct ApplyOutcome {
     pub checks: Vec<PreCommitCheck>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PreCommitCheck { Build, Tests, Lints }
