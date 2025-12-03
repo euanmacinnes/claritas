@@ -341,7 +341,9 @@ async fn explain_with_postgres(dsn: &str, sql: &str, analyze: bool) -> anyhow::R
 }
 
 /// Convert JSON params into Postgres ToSql arguments.
-fn build_param_refs(params: &[Value]) -> (Vec<Box<dyn ToSql + Sync>>, Vec<&(dyn ToSql + Sync)>) {
+/// Returns owned values; callers can derive `&(dyn ToSql + Sync)` references
+/// with lifetimes tied to the returned vector.
+fn build_param_refs(params: &[Value]) -> Vec<Box<dyn ToSql + Sync>> {
     let mut boxed: Vec<Box<dyn ToSql + Sync>> = Vec::with_capacity(params.len());
     for v in params {
         match v {
@@ -364,8 +366,7 @@ fn build_param_refs(params: &[Value]) -> (Vec<Box<dyn ToSql + Sync>>, Vec<&(dyn 
             }
         }
     }
-    let ptrs: Vec<&(dyn ToSql + Sync)> = boxed.iter().map(|b| &**b as &(dyn ToSql + Sync)).collect();
-    (boxed, ptrs)
+    boxed
 }
 
 async fn execute_with_postgres_ext(dsn: &str, sql: &str, params: &[Value], limit: i64) -> anyhow::Result<Value> {
@@ -374,7 +375,8 @@ async fn execute_with_postgres_ext(dsn: &str, sql: &str, params: &[Value], limit
     let (client, conn) = pg::connect(dsn, pg::NoTls).await?;
     tokio::spawn(async move { let _ = conn.await; });
     let trimmed = sql.trim().to_ascii_lowercase();
-    let (owned, refs) = build_param_refs(params);
+    let owned = build_param_refs(params);
+    let refs: Vec<&(dyn ToSql + Sync)> = owned.iter().map(|b| &**b as &(dyn ToSql + Sync)).collect();
     if trimmed.starts_with("select") {
         let q = format!("WITH _q AS ({}) SELECT * FROM _q LIMIT {}", sql, limit);
         let rows = client.query(q.as_str(), &refs).await?;
@@ -413,7 +415,8 @@ async fn explain_with_postgres_ext(dsn: &str, sql: &str, params: &[Value], analy
     tokio::spawn(async move { let _ = conn.await; });
     let prefix = if analyze { "EXPLAIN (ANALYZE, VERBOSE, COSTS) " } else { "EXPLAIN (VERBOSE, COSTS) " };
     let q = format!("{}{}", prefix, sql);
-    let (_owned, refs) = build_param_refs(params);
+    let _owned = build_param_refs(params);
+    let refs: Vec<&(dyn ToSql + Sync)> = _owned.iter().map(|b| &**b as &(dyn ToSql + Sync)).collect();
     let rows = client.query(q.as_str(), &refs).await?;
     let mut plan_lines: Vec<String> = Vec::new();
     for r in rows { let txt: &str = r.get(0); plan_lines.push(txt.to_string()); }
