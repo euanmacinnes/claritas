@@ -13,6 +13,7 @@ use claritasai_web::{router, WebState};
 use claritasai_agents::AgentsHarness;
 use claritasai_mcp::ToolRegistry;
 use claritasai_notify::{NotifierHub, Provider as NotifyProvider, TelegramConfig as NotifyTelegramCfg, EmailConfig as NotifyEmailCfg, WhatsAppConfig as NotifyWhatsAppCfg};
+use claritasai_runtime::{Orchestrator, OrchestratorConfig};
 use tokio_postgres as pg;
 use url::Url;
 
@@ -130,6 +131,12 @@ async fn main() -> Result<()> {
     // Initialize a simple ToolRegistry from config
     let registry = build_tool_registry_from_config(cfg.as_ref());
     ws.tool_registry = Some(registry);
+    // Initialize Orchestrator with event_tx and configured timeouts
+    let orch_cfg = OrchestratorConfig { step_timeout_ms: ws.step_timeout_ms.unwrap_or(60_000) };
+    let orchestrator = Orchestrator::new(orch_cfg, Some(event_tx.clone()));
+    let orchestrator = Arc::new(tokio::sync::Mutex::new(orchestrator));
+    ws.orchestrator = Some(orchestrator);
+
     let state = Arc::new(ws);
     let app: Router = router(state);
     let addr: SocketAddr = cli

@@ -19,3 +19,4 @@ tokio-postgres = { workspace = true }
 url = { workspace = true }
 claritasai-agents = { path = "../claritasai-agents" }
 claritasai-notify = { path = "../claritasai-notify" }
+claritasai-runtime = { path = "../claritasai-runtime" }

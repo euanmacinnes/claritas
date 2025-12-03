@@ -1,5 +1,13 @@
 use claritasai_core::{Context, Plan, PlanVerdict};
 
+pub mod roles;
+pub mod patch_pipeline;
+pub mod orchestrator;
+
+pub use roles::{Role, RunState};
+pub use patch_pipeline::{PatchPipeline, ValidationReport, CommitReport};
+pub use orchestrator::{Orchestrator, OrchestratorConfig, RunId, Approval, ApprovalStatus};
+
 pub struct Runtime;
 
 impl Runtime {

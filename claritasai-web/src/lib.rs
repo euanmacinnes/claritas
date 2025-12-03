@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Form, State, Path as AxPath},
+    extract::{Form, State, Path as AxPath, Query},
     response::{Html, IntoResponse, Sse},
     response::sse::Event,
     routing::get,
@@ -15,11 +15,13 @@ use claritasai_agents::AgentsHarness;
 use tokio_postgres as pg;
 use serde_json::json;
 use tokio::sync::broadcast;
+use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 use tokio::time::Instant;
 use tokio_stream::wrappers::BroadcastStream;
 use claritasai_notify::{NotifierHub, NotifyMessage};
 use claritasai_core::{Workspace, Project, MemoryGuidelines, Plan};
+use claritasai_runtime::{Orchestrator, OrchestratorConfig, Approval, ApprovalStatus, Role};
 use serde::{Serialize, Deserialize};
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
@@ -51,6 +53,8 @@ pub struct WebState {
     pub agents_max_attempts: Option<usize>,
     // Executor config
     pub step_timeout_ms: Option<u64>,
+    // Orchestrator (in-memory governance state machine)
+    pub orchestrator: Option<Arc<Mutex<Orchestrator>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +89,10 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/runs/:id/artifacts", get(run_artifacts_get))
         .route("/artifacts/:id", get(artifact_download))
         .route("/memories", get(memories_list))
+        // Approvals and run control
+        .route("/runs/:id/approve", axum::routing::post(run_approve))
+        .route("/runs/:id/reject", axum::routing::post(run_reject))
+        .route("/runs/:id/resume", axum::routing::post(run_resume))
         // Workspaces/Projects and Guidelines management
         .route("/workspaces", get(workspaces_get).post(workspaces_post))
         .route("/projects", get(projects_get).post(projects_post))
@@ -110,6 +118,155 @@ async fn db_check(State(state): State<Arc<WebState>>) -> impl IntoResponse {
     } else {
         Json(json!({"ok": false, "message": "DB not configured"}))
     }
+}
+
+// ---- Approvals & resume endpoints (QA/Manager governance) ----
+
+#[derive(Debug, Clone, Deserialize)]
+struct RoleQuery { role: Option<String> }
+
+#[derive(Debug, Clone, Deserialize)]
+struct ApprovalBody {
+    rationale: Option<String>,
+    #[serde(default)]
+    required_changes: Vec<String>,
+}
+
+async fn run_approve(
+    State(state): State<Arc<WebState>>,
+    AxPath(run_id): AxPath<i64>,
+    Query(q): Query<RoleQuery>,
+    Json(body): Json<ApprovalBody>,
+) -> impl IntoResponse {
+    let role = q.role.unwrap_or_else(|| "QA".into());
+    let rationale = body.rationale.unwrap_or_else(|| "approved".into());
+    // Best-effort DB write of verdict linked to latest plan for the run
+    if let Some(dsn) = &state.db_dsn {
+        if let Ok((client, conn)) = pg::connect(dsn, pg::NoTls).await {
+            tokio::spawn(async move { let _ = conn.await; });
+            if let Ok(row_opt) = client.query_opt("SELECT id FROM plans WHERE run_id = $1 ORDER BY id DESC LIMIT 1", &[&run_id]).await {
+                if let Some(row) = row_opt {
+                    let plan_id: i64 = row.get(0);
+                    let _ = client.query(
+                        "INSERT INTO plan_verdicts(plan_id, status, rationale) VALUES($1,$2,$3)",
+                        &[&plan_id, &"Approved", &rationale]
+                    ).await;
+                }
+            }
+        }
+    }
+    // SSE event
+    if let Some(tx) = &state.event_tx {
+        let _ = tx.send(serde_json::to_string(&SseEvent{
+            event: "approval".into(),
+            run_id: Some(run_id),
+            plan_steps: None,
+            step_idx: None,
+            tool: None,
+            status: Some("Approved".into()),
+            message: Some(rationale.clone()),
+            chunk: None,
+            stream: None,
+            snippet: None,
+            has_more: None,
+            stdout_bytes: None,
+            stderr_bytes: None,
+            role: Some(role.clone()),
+            stage: Some(if role.eq_ignore_ascii_case("manager") { "manager_signoff" } else { "qa_verdict" }.into()),
+            json: Some(json!({"required_changes": body.required_changes})),
+        }).unwrap_or_else(|_| "{\"event\":\"approval\"}".into()));
+    }
+    // Orchestrator state transition
+    if let Some(orch) = &state.orchestrator {
+        let mut guard = orch.lock().await;
+        let role_enum = if role.eq_ignore_ascii_case("manager") { Role::Manager } else if role.eq_ignore_ascii_case("dev") { Role::Dev } else { Role::QA };
+        let appr = Approval { role: role_enum, status: ApprovalStatus::Approved, rationale: rationale.clone(), required_changes: body.required_changes.clone() };
+        if role_enum == Role::Manager { guard.apply_manager_verdict(run_id, &appr); } else { guard.apply_qa_verdict(run_id, &appr); }
+    }
+    Json(json!({"ok": true, "run_id": run_id, "role": role, "status": "Approved"}))
+}
+
+async fn run_reject(
+    State(state): State<Arc<WebState>>,
+    AxPath(run_id): AxPath<i64>,
+    Query(q): Query<RoleQuery>,
+    Json(body): Json<ApprovalBody>,
+) -> impl IntoResponse {
+    let role = q.role.unwrap_or_else(|| "QA".into());
+    let rationale = body.rationale.unwrap_or_else(|| "needs changes".into());
+    if let Some(dsn) = &state.db_dsn {
+        if let Ok((client, conn)) = pg::connect(dsn, pg::NoTls).await {
+            tokio::spawn(async move { let _ = conn.await; });
+            if let Ok(row_opt) = client.query_opt("SELECT id FROM plans WHERE run_id = $1 ORDER BY id DESC LIMIT 1", &[&run_id]).await {
+                if let Some(row) = row_opt {
+                    let plan_id: i64 = row.get(0);
+                    let _ = client.query(
+                        "INSERT INTO plan_verdicts(plan_id, status, rationale) VALUES($1,$2,$3)",
+                        &[&plan_id, &"NeedsChanges", &rationale]
+                    ).await;
+                }
+            }
+        }
+    }
+    if let Some(tx) = &state.event_tx {
+        let _ = tx.send(serde_json::to_string(&SseEvent{
+            event: "approval".into(),
+            run_id: Some(run_id),
+            plan_steps: None,
+            step_idx: None,
+            tool: None,
+            status: Some("NeedsChanges".into()),
+            message: Some(rationale.clone()),
+            chunk: None,
+            stream: None,
+            snippet: None,
+            has_more: None,
+            stdout_bytes: None,
+            stderr_bytes: None,
+            role: Some(role.clone()),
+            stage: Some(if role.eq_ignore_ascii_case("manager") { "manager_feedback" } else { "qa_verdict" }.into()),
+            json: Some(json!({"required_changes": body.required_changes})),
+        }).unwrap_or_else(|_| "{\"event\":\"approval\"}".into()));
+    }
+    // Orchestrator state transition
+    if let Some(orch) = &state.orchestrator {
+        let mut guard = orch.lock().await;
+        let role_enum = if role.eq_ignore_ascii_case("manager") { Role::Manager } else if role.eq_ignore_ascii_case("dev") { Role::Dev } else { Role::QA };
+        let appr = Approval { role: role_enum, status: ApprovalStatus::NeedsChanges, rationale: rationale.clone(), required_changes: body.required_changes.clone() };
+        if role_enum == Role::Manager { guard.apply_manager_verdict(run_id, &appr); } else { guard.apply_qa_verdict(run_id, &appr); }
+    }
+    Json(json!({"ok": true, "run_id": run_id, "role": role, "status": "NeedsChanges"}))
+}
+
+async fn run_resume(
+    State(state): State<Arc<WebState>>,
+    AxPath(run_id): AxPath<i64>,
+) -> impl IntoResponse {
+    if let Some(orch) = &state.orchestrator {
+        let mut guard = orch.lock().await;
+        guard.resume(run_id);
+    }
+    if let Some(tx) = &state.event_tx {
+        let _ = tx.send(serde_json::to_string(&SseEvent{
+            event: "run_resume".into(),
+            run_id: Some(run_id),
+            plan_steps: None,
+            step_idx: None,
+            tool: None,
+            status: Some("resume".into()),
+            message: Some("User requested resume".into()),
+            chunk: None,
+            stream: None,
+            snippet: None,
+            has_more: None,
+            stdout_bytes: None,
+            stderr_bytes: None,
+            role: None,
+            stage: Some("resume".into()),
+            json: None,
+        }).unwrap_or_else(|_| "{\"event\":\"run_resume\"}".into()));
+    }
+    Json(json!({"ok": true, "run_id": run_id}))
 }
 
 // ---------------- File-based persistence for Workspaces/Projects/Guidelines ----------------
@@ -746,6 +903,11 @@ async fn chat_post(
         if let Some(tx) = &state.event_tx {
             let _ = tx.send(serde_json::to_string(&SseEvent{ event: "run_started".into(), run_id, plan_steps: None, step_idx: None, tool: None, status: None, message: Some("planning started".into()), chunk: None, stream: None, snippet: None, has_more: None, stdout_bytes: None, stderr_bytes: None, role: None, stage: None, json: None }).unwrap_or_else(|_| "{\"event\":\"run_started\"}".into()));
         }
+        // Orchestrator: start run
+        if let (Some(orch), Some(rid)) = (&state.orchestrator, run_id) {
+            let mut guard = orch.lock().await;
+            guard.start_run(rid);
+        }
 
         // Draft plan (use agents if available)
         // Load top-K memories for planning context
@@ -803,11 +965,11 @@ async fn chat_post(
                     if let Some(tx) = &state.event_tx {
                         let _ = tx.send(serde_json::json!({"event":"agents_error","message": e.to_string()}).to_string());
                     }
-                    planner.draft_plan(&form.objective)
+                    claritasai_core::Plan::from(planner.draft_plan(&form.objective))
                 }
             }
         } else {
-            planner.draft_plan(&form.objective)
+            claritasai_core::Plan::from(planner.draft_plan(&form.objective))
         };
         // Attach project/parent references
         plan.project_id = form.project_id.clone();
@@ -857,6 +1019,11 @@ async fn chat_post(
         }
         if let Some(tx) = &state.event_tx {
             let _ = tx.send(serde_json::to_string(&SseEvent{ event: "plan_saved".into(), run_id, plan_steps: Some(plan.steps.len()), step_idx: None, tool: None, status: Some("ok".into()), message: None, chunk: None, stream: None, snippet: None, has_more: None, stdout_bytes: None, stderr_bytes: None, role: None, stage: None, json: None }).unwrap_or_else(|_| "{\"event\":\"plan_saved\"}".into()));
+        }
+        // Orchestrator: plan saved -> move to Reviewing
+        if let (Some(orch), Some(rid)) = (&state.orchestrator, run_id) {
+            let mut guard = orch.lock().await;
+            guard.plan_saved(rid);
         }
 
         // Verify (use agents QA + Manager if available)
