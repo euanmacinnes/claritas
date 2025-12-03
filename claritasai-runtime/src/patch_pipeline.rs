@@ -72,16 +72,20 @@ impl PatchPipeline {
             // Build
             gate_events.push(self.emit_gate_started("rust.cargo.build.debug", root));
             let g_start = Instant::now();
+            let build_timeout = 120u64;
             let build_res = self.registry.call_with_timeout(
                 "rust.cargo.build.debug",
                 json!({"path": root}),
-                120,
+                build_timeout,
             ).await;
             match build_res {
-                Ok(_) => {
+                Ok(val) => {
                     checks.push(PreCommitCheck::Build);
                     details.push("rust build ok".into());
-                    gate_events.push(self.emit_gate_finished("rust.cargo.build.debug", root, true, g_start.elapsed().as_millis(), None));
+                    let mut ev = self.emit_gate_finished("rust.cargo.build.debug", root, true, g_start.elapsed().as_millis(), None, None);
+                    let (so, se) = extract_snips(&val);
+                    ev.stdout_snip = so; ev.stderr_snip = se;
+                    gate_events.push(ev);
                 }
                 Err(e) => {
                     ok = false;
@@ -90,49 +94,63 @@ impl PatchPipeline {
                         friendly_mcp_error("rust", &e.to_string())
                     );
                     details.push(msg.clone());
-                    gate_events.push(self.emit_gate_finished("rust.cargo.build.debug", root, false, g_start.elapsed().as_millis(), Some(msg)));
+                    let timeout_ms = if e.to_string().contains("timeout waiting for MCP response") { Some(build_timeout * 1000) } else { None };
+                    let ev = self.emit_gate_finished("rust.cargo.build.debug", root, false, g_start.elapsed().as_millis(), Some(msg), timeout_ms);
+                    gate_events.push(ev);
                 }
             }
             // Tests
             gate_events.push(self.emit_gate_started("rust.cargo.test", root));
             let g_start = Instant::now();
+            let test_timeout = 120u64;
             let test_res = self.registry.call_with_timeout(
                 "rust.cargo.test",
                 json!({"path": root}),
-                120,
+                test_timeout,
             ).await;
             match test_res {
-                Ok(_) => {
+                Ok(val) => {
                     checks.push(PreCommitCheck::Tests);
                     details.push("rust tests ok".into());
-                    gate_events.push(self.emit_gate_finished("rust.cargo.test", root, true, g_start.elapsed().as_millis(), None));
+                    let mut ev = self.emit_gate_finished("rust.cargo.test", root, true, g_start.elapsed().as_millis(), None, None);
+                    let (so, se) = extract_snips(&val);
+                    ev.stdout_snip = so; ev.stderr_snip = se;
+                    gate_events.push(ev);
                 }
                 Err(e) => {
                     ok = false;
                     let msg = format!("rust tests failed: {}", friendly_mcp_error("rust", &e.to_string()));
                     details.push(msg.clone());
-                    gate_events.push(self.emit_gate_finished("rust.cargo.test", root, false, g_start.elapsed().as_millis(), Some(msg)));
+                    let timeout_ms = if e.to_string().contains("timeout waiting for MCP response") { Some(test_timeout * 1000) } else { None };
+                    let ev = self.emit_gate_finished("rust.cargo.test", root, false, g_start.elapsed().as_millis(), Some(msg), timeout_ms);
+                    gate_events.push(ev);
                 }
             }
             // Lints (clippy)
             gate_events.push(self.emit_gate_started("rust.clippy", root));
             let g_start = Instant::now();
+            let clippy_timeout = 60u64;
             let clippy_res = self.registry.call_with_timeout(
                 "rust.clippy",
                 json!({"path": root}),
-                60,
+                clippy_timeout,
             ).await;
             match clippy_res {
-                Ok(_) => {
+                Ok(val) => {
                     checks.push(PreCommitCheck::Lints);
                     details.push("rust clippy ok".into());
-                    gate_events.push(self.emit_gate_finished("rust.clippy", root, true, g_start.elapsed().as_millis(), None));
+                    let mut ev = self.emit_gate_finished("rust.clippy", root, true, g_start.elapsed().as_millis(), None, None);
+                    let (so, se) = extract_snips(&val);
+                    ev.stdout_snip = so; ev.stderr_snip = se;
+                    gate_events.push(ev);
                 }
                 Err(e) => {
                     ok = false;
                     let msg = format!("rust clippy failed: {}", friendly_mcp_error("rust", &e.to_string()));
                     details.push(msg.clone());
-                    gate_events.push(self.emit_gate_finished("rust.clippy", root, false, g_start.elapsed().as_millis(), Some(msg)));
+                    let timeout_ms = if e.to_string().contains("timeout waiting for MCP response") { Some(clippy_timeout * 1000) } else { None };
+                    let ev = self.emit_gate_finished("rust.clippy", root, false, g_start.elapsed().as_millis(), Some(msg), timeout_ms);
+                    gate_events.push(ev);
                 }
             }
         }
@@ -142,39 +160,51 @@ impl PatchPipeline {
             // Lint
             gate_events.push(self.emit_gate_started("python.lint", root));
             let g_start = Instant::now();
-            let pylint_res = self.registry.call_with_timeout("python.lint", json!({"path": root}), 30).await;
+            let py_lint_timeout = 30u64;
+            let pylint_res = self.registry.call_with_timeout("python.lint", json!({"path": root}), py_lint_timeout).await;
             match pylint_res {
-                Ok(_) => {
+                Ok(val) => {
                     if !checks.contains(&PreCommitCheck::Lints) { checks.push(PreCommitCheck::Lints); }
                     details.push("python lint ok".into());
-                    gate_events.push(self.emit_gate_finished("python.lint", root, true, g_start.elapsed().as_millis(), None));
+                    let mut ev = self.emit_gate_finished("python.lint", root, true, g_start.elapsed().as_millis(), None, None);
+                    let (so, se) = extract_snips(&val);
+                    ev.stdout_snip = so; ev.stderr_snip = se;
+                    gate_events.push(ev);
                 }
                 Err(e) => {
                     ok = false;
                     let msg = format!("python lint failed: {}", friendly_mcp_error("python", &e.to_string()));
                     details.push(msg.clone());
-                    gate_events.push(self.emit_gate_finished("python.lint", root, false, g_start.elapsed().as_millis(), Some(msg)));
+                    let timeout_ms = if e.to_string().contains("timeout waiting for MCP response") { Some(py_lint_timeout * 1000) } else { None };
+                    let ev = self.emit_gate_finished("python.lint", root, false, g_start.elapsed().as_millis(), Some(msg), timeout_ms);
+                    gate_events.push(ev);
                 }
             }
             // Unit tests
             gate_events.push(self.emit_gate_started("python.test.unit", root));
             let g_start = Instant::now();
+            let py_test_timeout = 90u64;
             let pytest_res = self.registry.call_with_timeout(
                 "python.test.unit",
                 json!({"path": root}),
-                90,
+                py_test_timeout,
             ).await;
             match pytest_res {
-                Ok(_) => {
+                Ok(val) => {
                     if !checks.contains(&PreCommitCheck::Tests) { checks.push(PreCommitCheck::Tests); }
                     details.push("python unit tests ok".into());
-                    gate_events.push(self.emit_gate_finished("python.test.unit", root, true, g_start.elapsed().as_millis(), None));
+                    let mut ev = self.emit_gate_finished("python.test.unit", root, true, g_start.elapsed().as_millis(), None, None);
+                    let (so, se) = extract_snips(&val);
+                    ev.stdout_snip = so; ev.stderr_snip = se;
+                    gate_events.push(ev);
                 }
                 Err(e) => {
                     ok = false;
                     let msg = format!("python unit tests failed: {}", friendly_mcp_error("python", &e.to_string()));
                     details.push(msg.clone());
-                    gate_events.push(self.emit_gate_finished("python.test.unit", root, false, g_start.elapsed().as_millis(), Some(msg)));
+                    let timeout_ms = if e.to_string().contains("timeout waiting for MCP response") { Some(py_test_timeout * 1000) } else { None };
+                    let ev = self.emit_gate_finished("python.test.unit", root, false, g_start.elapsed().as_millis(), Some(msg), timeout_ms);
+                    gate_events.push(ev);
                 }
             }
         }
@@ -235,6 +265,39 @@ impl PatchPipeline {
     }
 }
 
+fn extract_snips(val: &serde_json::Value) -> (Option<String>, Option<String>) {
+    // Try common keys and produce trimmed snippets
+    fn trim(s: &str, cap: usize) -> String {
+        let mut out = s.to_string();
+        if out.len() > cap { out.truncate(cap); }
+        out
+    }
+    let cap: usize = 16 * 1024; // 16KB snippets
+    let mut so: Option<String> = None;
+    let mut se: Option<String> = None;
+    if let Some(s) = val.get("stdout").and_then(|x| x.as_str()) {
+        so = Some(trim(s, cap));
+    }
+    if let Some(s) = val.get("stderr").and_then(|x| x.as_str()) {
+        se = Some(trim(s, cap));
+    }
+    if so.is_none() {
+        if let Some(s) = val.get("out").and_then(|x| x.as_str()) {
+            so = Some(trim(s, cap));
+        }
+    }
+    if se.is_none() {
+        if let Some(s) = val.get("err").and_then(|x| x.as_str()) {
+            se = Some(trim(s, cap));
+        }
+    }
+    // If value is a string, treat as stdout
+    if so.is_none() && val.is_string() {
+        if let Some(s) = val.as_str() { so = Some(trim(s, cap)); }
+    }
+    (so, se)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GateEvent {
     pub gate: String,
@@ -242,14 +305,18 @@ pub struct GateEvent {
     pub ok: bool,
     pub duration_ms: u128,
     pub message: Option<String>,
+    pub timeout_ms: Option<u64>,
+    /// Optional short outputs for UI/log artifacts (when available from hosts)
+    pub stdout_snip: Option<String>,
+    pub stderr_snip: Option<String>,
 }
 
 impl GateEvent {
     fn started(gate: &str, root: &str) -> Self {
-        Self { gate: gate.to_string(), root: root.to_string(), ok: false, duration_ms: 0, message: None }
+        Self { gate: gate.to_string(), root: root.to_string(), ok: false, duration_ms: 0, message: None, timeout_ms: None, stdout_snip: None, stderr_snip: None }
     }
-    fn finished(gate: &str, root: &str, ok: bool, duration_ms: u128, message: Option<String>) -> Self {
-        Self { gate: gate.to_string(), root: root.to_string(), ok, duration_ms, message }
+    fn finished(gate: &str, root: &str, ok: bool, duration_ms: u128, message: Option<String>, timeout_ms: Option<u64>) -> Self {
+        Self { gate: gate.to_string(), root: root.to_string(), ok, duration_ms, message, timeout_ms, stdout_snip: None, stderr_snip: None }
     }
 }
 
@@ -265,17 +332,17 @@ impl PatchPipeline {
         }
         GateEvent::started(gate, root)
     }
-    fn emit_gate_finished(&self, gate: &str, root: &str, ok: bool, duration_ms: u128, message: Option<String>) -> GateEvent {
+    fn emit_gate_finished(&self, gate: &str, root: &str, ok: bool, duration_ms: u128, message: Option<String>, timeout_ms: Option<u64>) -> GateEvent {
         if let Some(tx) = &self.event_tx {
             let _ = tx.send(json!({
                 "event": "gate_finished",
                 "tool": gate,
                 "status": if ok { "ok" } else { "failed" },
                 "message": message,
-                "json": {"duration_ms": duration_ms, "root": root},
+                "json": {"duration_ms": duration_ms, "root": root, "timeout_ms": timeout_ms},
             }).to_string());
         }
-        GateEvent::finished(gate, root, ok, duration_ms, message)
+        GateEvent::finished(gate, root, ok, duration_ms, message, timeout_ms)
     }
 }
 

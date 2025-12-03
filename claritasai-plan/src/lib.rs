@@ -59,4 +59,14 @@ impl Planner {
             ..Default::default()
         }
     }
+
+    /// Draft a plan while being provided with prior project memories.
+    /// Current MVP ignores memories but keeps API for forward compatibility.
+    pub fn draft_plan_with_memories(
+        &self,
+        objective: &str,
+        _memories: &[serde_json::Value],
+    ) -> Plan {
+        self.draft_plan(objective)
+    }
 }

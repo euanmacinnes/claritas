@@ -1,3 +1,4 @@
+
 use std::collections::HashMap;
 
 // no serde derives needed on internal types here
@@ -20,24 +21,21 @@ pub struct Approval {
 }
 
 #[derive(Debug, Clone)]
-pub struct OrchestratorConfig {
-    pub step_timeout_ms: u64,
-}
-
-impl Default for OrchestratorConfig {
-    fn default() -> Self { Self { step_timeout_ms: 60_000 } }
-}
+pub struct OrchestratorConfig { pub step_timeout_ms: u64 }
+impl Default for OrchestratorConfig { fn default() -> Self { Self { step_timeout_ms: 60_000 } } }
 
 #[derive(Debug, Default)]
 pub struct Orchestrator {
     runs: HashMap<RunId, RunState>,
     tx: Option<Sender<String>>, // JSON-encoded SSE-like events
     cfg: OrchestratorConfig,
+    qa_approved: HashMap<RunId, bool>,
+    mgr_approved: HashMap<RunId, bool>,
 }
 
 impl Orchestrator {
     pub fn new(cfg: OrchestratorConfig, tx: Option<Sender<String>>) -> Self {
-        Self { runs: HashMap::new(), tx, cfg }
+        Self { runs: HashMap::new(), tx, cfg, qa_approved: HashMap::new(), mgr_approved: HashMap::new() }
     }
 
     pub fn state_of(&self, run_id: RunId) -> Option<RunState> { self.runs.get(&run_id).copied() }
@@ -54,24 +52,16 @@ impl Orchestrator {
 
     pub fn apply_qa_verdict(&mut self, run_id: RunId, approval: &Approval) {
         match approval.status {
-            ApprovalStatus::Approved => {
-                self.runs.insert(run_id, RunState::Approved);
-            }
-            ApprovalStatus::NeedsChanges => {
-                self.runs.insert(run_id, RunState::Refining);
-            }
+            ApprovalStatus::Approved => { self.runs.insert(run_id, RunState::Approved); self.qa_approved.insert(run_id, true); }
+            ApprovalStatus::NeedsChanges => { self.runs.insert(run_id, RunState::Refining); self.qa_approved.insert(run_id, false); }
         }
         self.emit_verdict(run_id, approval);
     }
 
     pub fn apply_manager_verdict(&mut self, run_id: RunId, approval: &Approval) {
         match approval.status {
-            ApprovalStatus::Approved => {
-                self.runs.insert(run_id, RunState::Executing);
-            }
-            ApprovalStatus::NeedsChanges => {
-                self.runs.insert(run_id, RunState::Refining);
-            }
+            ApprovalStatus::Approved => { self.runs.insert(run_id, RunState::Executing); self.mgr_approved.insert(run_id, true); }
+            ApprovalStatus::NeedsChanges => { self.runs.insert(run_id, RunState::Refining); self.mgr_approved.insert(run_id, false); }
         }
         self.emit_verdict(run_id, approval);
     }
@@ -87,7 +77,6 @@ impl Orchestrator {
     }
 
     pub fn resume(&mut self, run_id: RunId) {
-        // On resume, return to Reviewing if we were refining/blocked, else keep current
         let next = match self.runs.get(&run_id).copied() {
             Some(RunState::Refining) | Some(RunState::Blocked) => RunState::Reviewing,
             Some(s) => s,
@@ -108,7 +97,6 @@ impl Orchestrator {
             "rationale": approval.rationale,
             "required_changes": approval.required_changes,
         }));
-        // Also emit a state snapshot
         if let Some(state) = self.runs.get(&run_id) {
             self.emit_state(run_id, Some("state_update"), None, Some(*state));
         }
@@ -127,8 +115,16 @@ impl Orchestrator {
     }
 
     fn emit_json(&self, v: serde_json::Value) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(v.to_string());
+        if let Some(tx) = &self.tx { let _ = tx.send(v.to_string()); }
+    }
+
+    pub fn can_apply(&self, run_id: RunId, scope_change: bool) -> (bool, String) {
+        let qa_ok = self.qa_approved.get(&run_id).copied().unwrap_or(false);
+        if !qa_ok { return (false, "Awaiting QA approval".into()); }
+        if scope_change {
+            let mgr_ok = self.mgr_approved.get(&run_id).copied().unwrap_or(false);
+            if !mgr_ok { return (false, "Awaiting Manager approval for scope change".into()); }
         }
+        (true, String::new())
     }
 }

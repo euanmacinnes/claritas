@@ -4,6 +4,8 @@ pub mod patch;
 pub mod fs;
 pub use patch::{Patch, PatchFormat, ApplyMode, ApplyOutcome, PreCommitCheck, DiffPreview};
 pub use fs::SafeFs;
+pub mod graph;
+pub use graph::{ProjectGraph, TestTarget, LangKind, GraphMember};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {

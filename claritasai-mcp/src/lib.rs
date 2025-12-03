@@ -7,6 +7,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
 use tokio::time::{timeout, Duration};
 use tokio::time::sleep;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capability {
@@ -292,6 +293,8 @@ struct RegistryInner {
     prefix_map: HashMap<String, String>,
     // server_id -> managed client
     clients: HashMap<String, Arc<tokio::sync::Mutex<ManagedClient>>>,
+    // last known health ok-status per server_id (for transition tracking)
+    last_health: HashMap<String, bool>,
 }
 
 #[derive(Clone)]
@@ -470,8 +473,45 @@ impl ToolRegistry {
                 (ok, caps)
             };
             let caps_json: Vec<Value> = caps.into_iter().map(|c| json!({"name": c.name})).collect();
-            result.insert(sid, json!({"ok": ok, "capabilities": caps_json}));
+            // Enrich with last_ok (unix ms) and last_error (placeholder until detailed errors are tracked)
+            let last_ok_ms = if ok {
+                Some(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64,
+                )
+            } else { None };
+            let mut obj = json!({"ok": ok, "capabilities": caps_json});
+            if let Some(ms) = last_ok_ms { obj["last_ok"] = json!(ms); }
+            // keep last_error optional (null) for now
+            obj["last_error"] = Value::Null;
+            result.insert(sid, obj);
         }
         result
+    }
+
+    /// Status plus transitions since last call. Transitions are captured for the `ok` flag only.
+    pub async fn status_all_with_transitions(
+        &self,
+        timeout_secs: u64,
+    ) -> (HashMap<String, serde_json::Value>, Vec<(String, bool, bool)>) {
+        let statuses = self.status_all(timeout_secs).await;
+        let mut transitions: Vec<(String, bool, bool)> = Vec::new();
+        // update cache and compute transitions
+        let mut guard = self.inner.write().await;
+        for (sid, val) in &statuses {
+            let ok_now = val.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+            if let Some(prev) = guard.last_health.get(sid).copied() {
+                if prev != ok_now {
+                    transitions.push((sid.clone(), prev, ok_now));
+                }
+            } else {
+                // first observation — treat as transition from false if ok
+                if ok_now { transitions.push((sid.clone(), false, ok_now)); }
+            }
+            guard.last_health.insert(sid.clone(), ok_now);
+        }
+        (statuses, transitions)
     }
 }
