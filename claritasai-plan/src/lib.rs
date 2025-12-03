@@ -17,6 +17,6 @@ impl Planner {
         // 3) clarium validate simple SQL
         steps.push(PlanStep { tool_ref: "clarium.validate_sql".into(), input: serde_json::json!({ "sql": "SELECT 1" }) });
 
-        Plan { objective: objective.to_string(), steps }
+        Plan { objective: objective.to_string(), steps, project_id: None, parent_plan_id: None }
     }
 }

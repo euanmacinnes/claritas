@@ -115,7 +115,7 @@ impl AgentsHarness {
             .into_iter()
             .map(|s| PlanStep { tool_ref: s.tool_ref, input: s.input })
             .collect();
-        Ok(Plan { objective: resp.objective, steps })
+        Ok(Plan { objective: resp.objective, steps, project_id: None, parent_plan_id: None })
     }
 
     /// Same as `draft_plan` but allows passing prior memory/context to seed the prompt.
@@ -137,7 +137,7 @@ impl AgentsHarness {
             .into_iter()
             .map(|s| PlanStep { tool_ref: s.tool_ref, input: s.input })
             .collect();
-        Ok(Plan { objective: resp.objective, steps })
+        Ok(Plan { objective: resp.objective, steps, project_id: None, parent_plan_id: None })
     }
 
     pub async fn review_plan(&self, plan: &Plan) -> anyhow::Result<PlanVerdict> {
@@ -223,7 +223,7 @@ impl AgentsHarness {
             .into_iter()
             .map(|s| PlanStep { tool_ref: s.tool_ref, input: s.input })
             .collect();
-        Ok(Plan { objective: resp.objective, steps })
+        Ok(Plan { objective: resp.objective, steps, project_id: None, parent_plan_id: None })
     }
 
     /// Dev refinement with additional memory/context included.
@@ -246,6 +246,6 @@ impl AgentsHarness {
             .into_iter()
             .map(|s| PlanStep { tool_ref: s.tool_ref, input: s.input })
             .collect();
-        Ok(Plan { objective: resp.objective, steps })
+        Ok(Plan { objective: resp.objective, steps, project_id: None, parent_plan_id: None })
     }
 }

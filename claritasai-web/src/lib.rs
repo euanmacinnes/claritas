@@ -19,6 +19,7 @@ use tokio_stream::StreamExt;
 use tokio::time::Instant;
 use tokio_stream::wrappers::BroadcastStream;
 use claritasai_notify::{NotifierHub, NotifyMessage};
+use claritasai_core::{Workspace, Project, MemoryGuidelines, Plan};
 use serde::{Serialize, Deserialize};
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
@@ -26,6 +27,8 @@ use tokio::fs as tfs;
 use axum::Json;
 use axum::http::{HeaderMap, header, StatusCode};
 use sha2::{Sha256, Digest};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::process::Command;
 
 #[derive(Clone, Default)]
 pub struct WebState {
@@ -82,6 +85,10 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/runs/:id/artifacts", get(run_artifacts_get))
         .route("/artifacts/:id", get(artifact_download))
         .route("/memories", get(memories_list))
+        // Workspaces/Projects and Guidelines management
+        .route("/workspaces", get(workspaces_get).post(workspaces_post))
+        .route("/projects", get(projects_get).post(projects_post))
+        .route("/projects/:id/guidelines", get(guidelines_get).post(guidelines_post))
         .with_state(state)
 }
 
@@ -105,6 +112,187 @@ async fn db_check(State(state): State<Arc<WebState>>) -> impl IntoResponse {
     }
 }
 
+// ---------------- File-based persistence for Workspaces/Projects/Guidelines ----------------
+
+fn storage_base() -> PathBuf {
+    let mut p = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    p.push("configs");
+    p
+}
+
+async fn ensure_dir(path: &PathBuf) {
+    let _ = tfs::create_dir_all(path).await;
+}
+
+async fn load_json_file<T: for<'de> Deserialize<'de> + Default>(path: &PathBuf) -> T {
+    match tfs::read(path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default()
+        , Err(_) => Default::default(),
+    }
+}
+
+async fn save_json_file<T: Serialize>(path: &PathBuf, value: &T) -> Result<(), String> {
+    if let Some(parent) = path.parent() { let _ = tfs::create_dir_all(parent).await; }
+    let s = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
+    tfs::write(path, s.as_bytes()).await.map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct WorkspacesDoc { items: Vec<Workspace> }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ProjectsDoc { items: Vec<Project> }
+
+async fn load_workspaces() -> WorkspacesDoc {
+    let mut p = storage_base(); p.push("workspaces.json");
+    load_json_file(&p).await
+}
+
+async fn save_workspaces(doc: &WorkspacesDoc) -> Result<(), String> {
+    let mut p = storage_base(); p.push("workspaces.json");
+    save_json_file(&p, doc).await
+}
+
+async fn load_projects() -> ProjectsDoc {
+    let mut p = storage_base(); p.push("projects.json");
+    load_json_file(&p).await
+}
+
+async fn save_projects(doc: &ProjectsDoc) -> Result<(), String> {
+    let mut p = storage_base(); p.push("projects.json");
+    save_json_file(&p, doc).await
+}
+
+async fn load_guidelines(project_id: &str) -> MemoryGuidelines {
+    let mut p = storage_base(); p.push("guidelines"); p.push(format!("{}.json", project_id));
+    load_json_file(&p).await
+}
+
+async fn save_guidelines(project_id: &str, g: &MemoryGuidelines) -> Result<(), String> {
+    let mut p = storage_base(); p.push("guidelines"); p.push(format!("{}.json", project_id));
+    save_json_file(&p, g).await
+}
+
+fn gen_id(seed: &str) -> String {
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+    let mut hasher = Sha256::new();
+    hasher.update(seed.as_bytes());
+    hasher.update(ts.to_string().as_bytes());
+    let digest = hasher.finalize();
+    let hex = hex::encode(digest);
+    hex[..12].to_string()
+}
+
+// ---------------- Handlers: Workspaces/Projects/Guidelines ----------------
+
+async fn workspaces_get() -> Html<String> {
+    let doc = load_workspaces().await;
+    let mut html = String::from(r#"<!doctype html><html><head><meta charset='utf-8'><title>Workspaces</title><script src='https://unpkg.com/htmx.org@1.9.12'></script></head><body>"#);
+    html.push_str("<h2>Workspaces</h2><ul>");
+    for ws in doc.items.iter() {
+        html.push_str(&format!("<li><b>{}</b> <code>{}</code> {}</li>", htmlescape::encode_minimal(&ws.name), htmlescape::encode_minimal(&ws.id), htmlescape::encode_minimal(&ws.root_path.clone().unwrap_or_default())));
+    }
+    html.push_str("</ul><h3>Create Workspace</h3>");
+    html.push_str("<form hx-post='/workspaces' hx-target='body' hx-swap='outerHTML'>");
+    html.push_str("<input name='name' placeholder='Name' /> <input name='root_path' placeholder='Root path (optional)' /> <button type='submit'>Create</button>");
+    html.push_str("</form>");
+    html.push_str("<p><a href='/projects'>Projects</a> · <a href='/chat'>Back</a></p>");
+    html.push_str("</body></html>");
+    Html(html)
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceForm { name: String, root_path: Option<String> }
+
+async fn workspaces_post(Form(form): Form<WorkspaceForm>) -> impl IntoResponse {
+    let mut doc = load_workspaces().await;
+    let id = gen_id(&form.name);
+    let ws = Workspace{ id, name: form.name, root_path: form.root_path, description: None };
+    doc.items.push(ws);
+    match save_workspaces(&doc).await {
+        Ok(_) => workspaces_get().await.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+async fn projects_get() -> Html<String> {
+    let wdoc = load_workspaces().await;
+    let pdoc = load_projects().await;
+    let mut html = String::from(r#"<!doctype html><html><head><meta charset='utf-8'><title>Projects</title><script src='https://unpkg.com/htmx.org@1.9.12'></script></head><body>"#);
+    html.push_str("<h2>Projects</h2><ul>");
+    for pr in pdoc.items.iter() {
+        let ws_name = wdoc.items.iter().find(|w| w.id==pr.workspace_id).map(|w| w.name.clone()).unwrap_or_else(||"?".into());
+        html.push_str(&format!("<li><b>{}</b> <code>{}</code> in <i>{}</i> — path: {} — <a href='/projects/{}/guidelines'>guidelines</a></li>", htmlescape::encode_minimal(&pr.name), htmlescape::encode_minimal(&pr.id), htmlescape::encode_minimal(&ws_name), htmlescape::encode_minimal(&pr.path), htmlescape::encode_minimal(&pr.id)));
+    }
+    html.push_str("</ul><h3>Create Project</h3>");
+    html.push_str("<form hx-post='/projects' hx-target='body' hx-swap='outerHTML'>");
+    html.push_str("<input name='name' placeholder='Name' /> ");
+    // workspace select
+    html.push_str("<select name='workspace_id'>");
+    for ws in wdoc.items.iter() { html.push_str(&format!("<option value='{}'>{}</option>", htmlescape::encode_minimal(&ws.id), htmlescape::encode_minimal(&ws.name))); }
+    html.push_str("</select> ");
+    html.push_str("<input name='path' placeholder='Folder path' style='width:320px'/> ");
+    html.push_str("<input name='repo_url' placeholder='Repo URL (optional)' style='width:260px'/> ");
+    html.push_str("<label><input type='checkbox' name='init_repo' value='1'/> init git repo</label> ");
+    html.push_str("<button type='submit'>Create</button>");
+    html.push_str("</form>");
+    html.push_str("<p><a href='/workspaces'>Workspaces</a> · <a href='/chat'>Back</a></p>");
+    html.push_str("</body></html>");
+    Html(html)
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectForm { name: String, workspace_id: String, path: String, repo_url: Option<String>, init_repo: Option<String> }
+
+async fn projects_post(Form(form): Form<ProjectForm>) -> impl IntoResponse {
+    let mut pdoc = load_projects().await;
+    let id = gen_id(&form.name);
+    let pr = Project{ id: id.clone(), workspace_id: form.workspace_id, name: form.name, path: form.path.clone(), repo_url: form.repo_url };
+    pdoc.items.push(pr);
+    if let Err(e) = save_projects(&pdoc).await { return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(); }
+    // optionally init repo
+    if form.init_repo.is_some() {
+        let _ = tfs::create_dir_all(&form.path).await;
+        // best-effort: git init
+        let _ = Command::new("git").arg("init").arg(&form.path).output().await;
+    }
+    projects_get().await.into_response()
+}
+
+async fn guidelines_get(AxPath(id): AxPath<String>) -> Html<String> {
+    let pdoc = load_projects().await;
+    let proj = pdoc.items.iter().find(|p| p.id==id).cloned();
+    let g = load_guidelines(&id).await;
+    let mut html = String::from(r#"<!doctype html><html><head><meta charset='utf-8'><title>Guidelines</title><script src='https://unpkg.com/htmx.org@1.9.12'></script></head><body>"#);
+    if let Some(pr) = proj {
+        html.push_str(&format!("<h2>Guidelines for <b>{}</b> <code>{}</code></h2>", htmlescape::encode_minimal(&pr.name), htmlescape::encode_minimal(&pr.id)));
+    } else {
+        html.push_str("<h2>Guidelines</h2>");
+    }
+    html.push_str("<form hx-post='' hx-target='body' hx-swap='outerHTML'>");
+    html.push_str(&format!("<textarea name='text' style='width:100%; height:200px'>{}</textarea>", htmlescape::encode_minimal(&g.text)));
+    html.push_str("<div><small>Metadata (JSON):</small><br/>");
+    html.push_str(&format!("<textarea name='metadata' style='width:100%; height:120px'>{}</textarea>", htmlescape::encode_minimal(&serde_json::to_string_pretty(&g.metadata).unwrap_or_else(|_| "{}".into()))));
+    html.push_str("</div><button type='submit'>Save</button> <a href='/projects'>Back</a></form>");
+    html.push_str("</body></html>");
+    Html(html)
+}
+
+#[derive(Debug, Deserialize)]
+struct GuidelinesForm { text: Option<String>, metadata: Option<String> }
+
+async fn guidelines_post(AxPath(id): AxPath<String>, Form(form): Form<GuidelinesForm>) -> impl IntoResponse {
+    let mut g = load_guidelines(&id).await;
+    if let Some(t) = form.text { g.text = t; }
+    if let Some(m) = form.metadata {
+        g.metadata = serde_json::from_str(&m).unwrap_or(serde_json::json!({}));
+    }
+    match save_guidelines(&id, &g).await {
+        Ok(_) => guidelines_get(AxPath(id)).await.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
 async fn chat_get() -> Html<&'static str> {
     Html(r##"<!doctype html>
 <html><head><meta charset='utf-8'><title>ClaritasAI Chat</title>
@@ -113,6 +301,8 @@ async fn chat_get() -> Html<&'static str> {
 <h1>ClaritasAI</h1>
 <form hx-post="/chat" hx-target="#out" hx-swap="beforeend">
   <input type="text" name="objective" placeholder="Enter objective" style="width:60%" />
+  <input type="text" name="project_id" placeholder="Project ID (optional)" style="width:20%" />
+  <input type="text" name="parent_plan_id" placeholder="Parent Plan ID (optional)" style="width:20%" />
   <button type="submit">Run</button>
   <div id="out" style="margin-top:1rem;"></div>
 </form>
@@ -509,7 +699,7 @@ async fn write_artifact_file(run_id: Option<i64>, step_id: i64, kind: &str, cont
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct ChatForm { objective: String }
+struct ChatForm { objective: String, project_id: Option<String>, parent_plan_id: Option<String> }
 
 async fn chat_post(
     State(state): State<Arc<WebState>>,
@@ -563,12 +753,50 @@ async fn chat_post(
         if let Some(client) = db_client.as_ref() {
             planning_memories = memory_query(client, "default", Some("%plan%"), 5).await;
         }
-        let mem_text = if planning_memories.is_empty() { None } else {
+        // Include per-project guidelines if provided
+        let mut mem_text_parts: Vec<String> = Vec::new();
+        if let Some(pid) = &form.project_id {
+            let g = load_guidelines(pid).await;
+            if !g.text.trim().is_empty() {
+                mem_text_parts.push(format!("Project guidelines for {}:\n{}", pid, g.text));
+            }
+        }
+        // Include parent plan context (best-effort: interpret parent_plan_id as prior run_id)
+        if let (Some(ppid), Some(client)) = (&form.parent_plan_id, db_client.as_ref()) {
+            if let Ok(prior_run_id) = ppid.parse::<i64>() {
+                // Fetch latest plan JSON for that run
+                if let Ok(rows) = client.query("SELECT json FROM plans WHERE run_id=$1 ORDER BY id DESC LIMIT 1", &[&prior_run_id]).await {
+                    if let Some(row) = rows.first() {
+                        let pj: serde_json::Value = row.get(0);
+                        mem_text_parts.push(format!("Parent plan (run {}):\n{}", prior_run_id, serde_json::to_string_pretty(&pj).unwrap_or_default()));
+                    }
+                }
+                // Fetch latest verdict/rationales if any
+                let q = r#"
+                    SELECT v.status, v.rationale
+                    FROM plan_verdicts v
+                    JOIN plans p ON v.plan_id = p.id
+                    WHERE p.run_id = $1
+                    ORDER BY v.id DESC
+                    LIMIT 1
+                "#;
+                if let Ok(rows) = client.query(q, &[&prior_run_id]).await {
+                    if let Some(row) = rows.first() {
+                        let status: String = row.get(0);
+                        let rationale: String = row.get(1);
+                        mem_text_parts.push(format!("Parent verdict: {} — {}", status, rationale));
+                    }
+                }
+            }
+        }
+        if !planning_memories.is_empty() {
             let mut s = String::from("Relevant prior learnings:\n");
             for it in &planning_memories { if let Some(c) = it.get("content").and_then(|v| v.as_str()) { s.push_str("- "); s.push_str(c); s.push('\n'); } }
-            Some(s)
-        };
-        let plan = if let Some(agents) = &state.agents {
+            mem_text_parts.push(s);
+        }
+        let mem_text = if mem_text_parts.is_empty() { None } else { Some(mem_text_parts.join("\n\n")) };
+
+        let mut plan = if let Some(agents) = &state.agents {
             match agents.draft_plan_with_context(&form.objective, mem_text.as_deref().unwrap_or("")) .await {
                 Ok(p) => p,
                 Err(e) => {
@@ -581,6 +809,9 @@ async fn chat_post(
         } else {
             planner.draft_plan(&form.objective)
         };
+        // Attach project/parent references
+        plan.project_id = form.project_id.clone();
+        plan.parent_plan_id = form.parent_plan_id.clone();
         // Agent message: Dev plan draft (when agents are enabled)
         if state.agents.is_some() {
             if let Some(tx) = &state.event_tx {
@@ -868,6 +1099,34 @@ async fn chat_post(
                     &[&"running", &run_id]).await;
             }
 
+            // Prepare per-execution context: project guidelines and parent context
+            let exec_guidelines = if let Some(pid) = &plan.project_id { load_guidelines(pid).await } else { MemoryGuidelines::default() };
+            let mut parent_ctx: Option<serde_json::Value> = None;
+            if let (Some(ppid), Some(client)) = (&plan.parent_plan_id, db_client.as_ref()) {
+                if let Ok(prior_run_id) = ppid.parse::<i64>() {
+                    let mut obj = serde_json::json!({});
+                    if let Ok(rows) = client.query("SELECT json FROM plans WHERE run_id=$1 ORDER BY id DESC LIMIT 1", &[&prior_run_id]).await {
+                        if let Some(row) = rows.first() { obj["plan"] = row.get::<_, serde_json::Value>(0); }
+                    }
+                    let q = r#"
+                        SELECT v.status, v.rationale
+                        FROM plan_verdicts v
+                        JOIN plans p ON v.plan_id = p.id
+                        WHERE p.run_id = $1
+                        ORDER BY v.id DESC
+                        LIMIT 1
+                    "#;
+                    if let Ok(rows) = client.query(q, &[&prior_run_id]).await {
+                        if let Some(row) = rows.first() {
+                            let status: String = row.get(0);
+                            let rationale: String = row.get(1);
+                            obj["verdict"] = serde_json::json!({"status": status, "rationale": rationale});
+                        }
+                    }
+                    parent_ctx = Some(obj);
+                }
+            }
+
             for (idx, step) in plan.steps.iter().enumerate() {
                 if let Some(tx) = &state.event_tx {
                     let _ = tx.send(serde_json::to_string(&SseEvent{ event: "step_started".into(), run_id, plan_steps: None, step_idx: Some(idx as i32), tool: Some(step.tool_ref.clone()), status: None, message: None, chunk: None, stream: None, snippet: None, has_more: None, stdout_bytes: None, stderr_bytes: None, role: None, stage: None, json: None }).unwrap_or_else(|_| "{\"event\":\"step_started\"}".into()));
@@ -881,7 +1140,18 @@ async fn chat_post(
                     ).await;
                 }
                 let step_start = Instant::now();
-                let call_res = reg.call(&step.tool_ref, step.input.clone()).await;
+                // Inject execution context into the tool input
+                let mut injected_input = step.input.clone();
+                // attach guidelines
+                let g_json = serde_json::json!({
+                    "text": exec_guidelines.text,
+                    "metadata": exec_guidelines.metadata,
+                });
+                if let serde_json::Value::Object(ref mut map) = injected_input {
+                    map.insert("__guidelines".into(), g_json);
+                    if let Some(pc) = parent_ctx.clone() { map.insert("__parent".into(), pc); }
+                }
+                let call_res = reg.call(&step.tool_ref, injected_input).await;
                 match call_res {
                     Ok(out) => {
                         // Emit partial chunks to UI for large outputs (stdout simulation)
