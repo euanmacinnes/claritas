@@ -8,6 +8,8 @@ use clap::Parser;
 use tracing::{error, info, warn, debug};
 use tracing_subscriber::EnvFilter;
 use tokio::sync::broadcast;
+use tokio::time::{timeout, Duration};
+use reqwest::Client as HttpClient;
 
 use claritasai_web::{router, WebState};
 use claritasai_agents::AgentsHarness;
@@ -31,17 +33,26 @@ struct Cli {
     /// Disable launching local MCP hosts
     #[arg(long, default_value_t = false)]
     no_local_mcp: bool,
+
+    /// Validate config (DB + LLM/models) and exit
+    #[arg(long, default_value_t = false)]
+    validate_config: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_target(false)
-        .init();
-
+    // Parse CLI first so we can control output style for validate-only runs
     let cli = Cli::parse();
-    info!(?cli, "starting claritasai");
+
+    // For normal runs, initialize tracing. For --validate-config, we intentionally skip
+    // tracing init so the validator can "just print" plain lines without log prefixes.
+    if !cli.validate_config {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .with_target(false)
+            .init();
+        info!(?cli, "starting claritasai");
+    }
 
     // Load YAML config (best-effort)
     let cfg: Option<AppConfig> = match std::fs::read_to_string(&cli.config) {
@@ -57,6 +68,30 @@ async fn main() -> Result<()> {
             None
         }
     };
+
+    // If requested, perform startup configuration validation and exit
+    if cli.validate_config {
+        match cfg.as_ref() {
+            Some(c) => {
+                // Always let the validator print its own summary, then exit with proper code.
+                match validate_startup(c).await {
+                    Ok(_) => {
+                        std::process::exit(0);
+                    }
+                    Err(_e) => {
+                        // Summary has already been printed inside validate_startup.
+                        std::process::exit(1);
+                    }
+                }
+            }
+            None => {
+                // Print a minimal message and exit with distinct code
+                println!("[ERR] no config loaded; cannot validate");
+                println!("overall: FAIL (0 ok, 1 errors)");
+                std::process::exit(2);
+            }
+        }
+    }
 
     // Shared event channel for SSE across app (MCP supervision + Web UI)
     let (event_tx, _event_rx) = broadcast::channel::<String>(256);
@@ -210,12 +245,26 @@ struct AgentsConfig {
     /// Max Dev↔QA refinement attempts
     #[serde(default)]
     max_attempts: Option<usize>,
+    #[serde(default)]
+    planner: Option<AgentRoleConfig>,
+    #[serde(default)]
+    verifier: Option<AgentRoleConfig>,
+    #[serde(default)]
+    executor: Option<AgentRoleConfig>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct OllamaConfig {
     #[serde(default)] url: String,
     #[serde(default)] model: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AgentRoleConfig {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -674,6 +723,323 @@ async fn ensure_db_and_migrate(target_dsn: &str) -> anyhow::Result<()> {
 
     // Connect to target and run migrations
     run_migrations(target_dsn).await?;
+    Ok(())
+}
+
+// ---------------- Startup Validation ----------------
+
+async fn validate_startup(cfg: &AppConfig) -> anyhow::Result<()> {
+    let mut errors: Vec<String> = Vec::new();
+    let mut oks: Vec<String> = Vec::new();
+
+    // DB connectivity check (when storage configured for clarium)
+    if let Some(storage) = &cfg.storage {
+        if storage.backend.eq_ignore_ascii_case("clarium") {
+            if let Some(cl) = &storage.clarium {
+                if let Some(dsn_raw) = &cl.dsn {
+                    let dsn = expand_env_vars(dsn_raw);
+                    if let Err(e) = validate_dsn(&dsn) {
+                        errors.push(format!("DB DSN invalid: {} ({})", mask_dsn(&dsn), e));
+                    } else if let Err(e) = check_db_connectivity(&dsn).await {
+                        errors.push(format!("DB connection failed: {} ({})", mask_dsn(&dsn), e));
+                    } else {
+                        let msg = format!("database connection OK: {}", mask_dsn(&dsn));
+                        oks.push(msg);
+
+                        // Since DB is reachable, ensure DB exists and run migrations/setup now
+                        match ensure_db_and_migrate(&dsn).await {
+                            Ok(_) => {
+                                oks.push("database setup/migrations OK".to_string());
+                                // After migrations, verify expected tables/columns exist
+                                match check_db_schema(&dsn).await {
+                                    Ok((schema_oks, schema_errs)) => {
+                                        oks.extend(schema_oks);
+                                        errors.extend(schema_errs);
+                                    }
+                                    Err(se) => {
+                                        errors.push(format!("database schema check failed: {}", se));
+                                    }
+                                }
+                            }
+                            Err(me) => {
+                                errors.push(format!("database setup/migrations failed: {}", me));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // LLM (Ollama) availability and models
+    let (ollama_url_opt, required_ollama_models) = collect_ollama_targets(cfg);
+    if let Some(ollama_url) = ollama_url_opt {
+        match check_ollama(&ollama_url, &required_ollama_models).await {
+            Ok(_) => {
+                if !required_ollama_models.is_empty() {
+                    let msg = format!(
+                        "ollama OK: {} (models available: {})",
+                        ollama_url,
+                        required_ollama_models.iter().cloned().collect::<Vec<_>>().join(", ")
+                    );
+                    info!("{}", msg);
+                    oks.push(msg);
+                } else {
+                    let msg = format!("ollama reachable: {}", ollama_url);
+                    info!("{}", msg);
+                    oks.push(msg);
+                }
+            }
+            Err(e) => {
+                // If the error indicates missing models, try to pull them, then re-check once
+                let emsg = e.to_string();
+                const PREFIX: &str = "missing ollama models:";
+                if let Some(idx) = emsg.to_lowercase().find(PREFIX) {
+                    // extract the CSV list that follows the prefix
+                    let list_str = emsg[(idx + PREFIX.len())..].trim();
+                    let missing: Vec<String> = list_str
+                        .split(',')
+                        .map(|s| s.trim().trim_matches('"').to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if !missing.is_empty() {
+                        info!(url=%ollama_url, models=?missing, "attempting to pull missing Ollama models");
+                        match pull_ollama_models(&ollama_url, &missing).await {
+                            Ok(_) => {
+                                oks.push(format!("ollama: pulled missing models at {}: {}", ollama_url, missing.join(", ")));
+                                // Re-check once after successful pulls
+                                match check_ollama(&ollama_url, &required_ollama_models).await {
+                                    Ok(_) => {
+                                        let msg = if required_ollama_models.is_empty() {
+                                            format!("ollama OK after pull: {}", ollama_url)
+                                        } else {
+                                            format!(
+                                                "ollama OK after pull: {} (models available: {})",
+                                                ollama_url,
+                                                required_ollama_models.iter().cloned().collect::<Vec<_>>().join(", ")
+                                            )
+                                        };
+                                        info!("{}", msg);
+                                        oks.push(msg);
+                                    }
+                                    Err(e2) => {
+                                        errors.push(format!("Ollama check failed at {} after pull: {}", ollama_url, e2));
+                                    }
+                                }
+                            }
+                            Err(pe) => {
+                                errors.push(format!("Ollama model pull failed at {}: {}", ollama_url, pe));
+                            }
+                        }
+                    } else {
+                        errors.push(format!("Ollama check failed at {}: {}", ollama_url, e));
+                    }
+                } else {
+                    errors.push(format!("Ollama check failed at {}: {}", ollama_url, e));
+                }
+            }
+        }
+    }
+
+    // Always print a concise summary so users see both successes and failures
+    println!("config validation summary:");
+    for ok in &oks {
+        println!("  [OK] {}", ok);
+    }
+    for err in &errors {
+        println!("  [ERR] {}", err);
+    }
+
+    if errors.is_empty() {
+        println!("overall: PASS ({} checks ok)", oks.len());
+        Ok(())
+    } else {
+        println!("overall: FAIL ({} ok, {} errors)", oks.len(), errors.len());
+        let msg = errors.join("; ");
+        anyhow::bail!(msg)
+    }
+}
+
+/// Verify that expected tables and columns exist after migrations.
+async fn check_db_schema(dsn: &str) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let mut oks = Vec::new();
+    let mut errs = Vec::new();
+
+    let (client, conn) = pg::connect(dsn, pg::NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            debug!(error=%e, "postgres connection driver ended during schema check");
+        }
+    });
+
+    use std::collections::{HashMap, HashSet};
+    let mut expected: HashMap<&str, HashSet<&str>> = HashMap::new();
+    expected.insert("runs", HashSet::from([
+        "id","started_at","agent_profile","status"
+    ]));
+    expected.insert("plans", HashSet::from([
+        "id","run_id","objective","json","created_at"
+    ]));
+    expected.insert("plan_verdicts", HashSet::from([
+        "id","plan_id","status","rationale","json","created_at"
+    ]));
+    expected.insert("executions", HashSet::from([
+        "id","plan_id","started_at","finished_at","status"
+    ]));
+    expected.insert("steps", HashSet::from([
+        "id","execution_id","idx","tool_ref","input_json","output_json","status","started_at","finished_at","stdout_snip","stderr_snip"
+    ]));
+    expected.insert("metrics", HashSet::from([
+        "id","run_id","key","value_num","value_text","source","created_at"
+    ]));
+    expected.insert("global_memories", HashSet::from([
+        "id","kind","key","content","tags","created_at"
+    ]));
+    expected.insert("project_memories", HashSet::from([
+        "id","project_key","kind","key","content","tags","created_at"
+    ]));
+    expected.insert("artifacts", HashSet::from([
+        "id","run_id","step_id","kind","path","mime","size_bytes","checksum","created_at"
+    ]));
+    expected.insert("step_attachments", HashSet::from([
+        "id","step_id","name","content_json","content_text","mime","size_bytes","created_at"
+    ]));
+
+    // Fetch existing tables in public schema
+    let rows = client
+        .query(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+            &[],
+        )
+        .await?;
+    let existing_tables: HashSet<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+
+    for (table, columns) in expected.iter() {
+        if !existing_tables.contains(&table.to_string()) {
+            errs.push(format!("missing table: {}", table));
+            continue;
+        }
+        // For present table, check columns
+        let rows = client
+            .query(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name = $1",
+                &[&table],
+            )
+            .await?;
+        let have: HashSet<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+        let mut missing_cols: Vec<&str> = Vec::new();
+        for col in columns {
+            if !have.contains(&col.to_string()) { missing_cols.push(col); }
+        }
+        if missing_cols.is_empty() {
+            oks.push(format!("table '{}' columns OK", table));
+        } else {
+            errs.push(format!(
+                "table '{}' missing columns: {}",
+                table,
+                missing_cols.join(", ")
+            ));
+        }
+    }
+
+    Ok((oks, errs))
+}
+
+async fn check_db_connectivity(dsn: &str) -> anyhow::Result<()> {
+    // Try connect with a short timeout and run a trivial query
+    let fut = pg::connect(dsn, pg::NoTls);
+    let (client, conn) = timeout(Duration::from_secs(5), fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("timeout connecting to database"))??;
+    // Drive connection in background
+    tokio::spawn(async move {
+        if let Err(e) = conn.await { tracing::debug!(error=%e, "postgres connection driver ended"); }
+    });
+    // Simple health query with timeout
+    timeout(Duration::from_secs(3), client.simple_query("SELECT 1"))
+        .await
+        .map_err(|_| anyhow::anyhow!("timeout running health query"))??;
+    Ok(())
+}
+
+fn collect_ollama_targets(cfg: &AppConfig) -> (Option<String>, std::collections::HashSet<String>) {
+    let mut url_opt: Option<String> = None;
+    let mut models: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(agents) = &cfg.agents {
+        if let Some(ol) = &agents.ollama {
+            if !ol.url.is_empty() { url_opt = Some(expand_env_vars(&ol.url)); }
+            if !ol.model.is_empty() { models.insert(expand_env_vars(&ol.model)); }
+        }
+        // role models
+        let push_model = |m: &Option<String>, set: &mut std::collections::HashSet<String>| {
+            if let Some(v) = m {
+                let mv = v.trim();
+                if mv.eq_ignore_ascii_case("none") || mv.is_empty() { return; }
+                // Only collect ollama-backed models here
+                if let Some(rest) = mv.strip_prefix("mcp:ollama:") {
+                    set.insert(rest.to_string());
+                }
+            }
+        };
+        if let Some(role) = &agents.planner { push_model(&role.model, &mut models); }
+        if let Some(role) = &agents.verifier { push_model(&role.model, &mut models); }
+        if let Some(role) = &agents.executor { push_model(&role.model, &mut models); }
+    }
+    (url_opt, models)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OllamaTagsResponse { #[serde(default)] models: Vec<OllamaModelTag> }
+#[derive(Debug, serde::Deserialize)]
+struct OllamaModelTag { #[serde(default)] name: String, #[serde(default)] model: String }
+
+async fn check_ollama(base_url: &str, required: &std::collections::HashSet<String>) -> anyhow::Result<()> {
+    let http = HttpClient::builder().timeout(Duration::from_secs(5)).build()?;
+    // Check server is up
+    let version_url = format!("{}/api/version", base_url.trim_end_matches('/'));
+    let _version = http.get(&version_url).send().await?.error_for_status()?;
+
+    if required.is_empty() { return Ok(()); }
+
+    // List models
+    let tags_url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+    let tags: OllamaTagsResponse = http.get(&tags_url).send().await?.error_for_status()?.json().await?;
+    let available: std::collections::HashSet<String> = tags.models.into_iter().map(|m| if !m.name.is_empty() { m.name } else { m.model }).collect();
+
+    // normalize helper: both with and without tag
+    let mut missing: Vec<String> = Vec::new();
+    'outer: for req in required {
+        let req_full = req;
+        let req_base = req_full.split(':').next().unwrap_or(req_full);
+        for have in &available {
+            if have == req_full { continue 'outer; }
+            let have_base = have.split(':').next().unwrap_or(have);
+            if have_base == req_base { continue 'outer; }
+        }
+        missing.push(req_full.clone());
+    }
+    if missing.is_empty() { Ok(()) } else { anyhow::bail!(format!("missing ollama models: {}", missing.join(", "))) }
+}
+
+/// Attempt to pull one or more missing models from the Ollama server.
+async fn pull_ollama_models(base_url: &str, models: &Vec<String>) -> anyhow::Result<()> {
+    if models.is_empty() { return Ok(()); }
+    let http = HttpClient::builder().timeout(Duration::from_secs(600)).build()?;
+    let pull_url = format!("{}/api/pull", base_url.trim_end_matches('/'));
+    for m in models {
+        info!(model=%m, url=%base_url, "pulling Ollama model");
+        let resp = http
+            .post(&pull_url)
+            .json(&serde_json::json!({ "name": m, "stream": false }))
+            .send()
+            .await?;
+        if let Err(e) = resp.error_for_status_ref() {
+            anyhow::bail!("failed to pull model {}: {}", m, e);
+        }
+        // Drain body to avoid connection reuse issues; ignore content
+        let _ = resp.bytes().await;
+        info!(model=%m, url=%base_url, "model pull completed");
+    }
     Ok(())
 }
 

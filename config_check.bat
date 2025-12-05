@@ -1,0 +1,1 @@
+cargo run -p claritasai-app -- --config configs/claritasai.yaml --validate-config
